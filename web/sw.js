@@ -1,5 +1,5 @@
 // Keeps Zuno working offline. Bump VERSION whenever app files change so phones pick up the new build.
-const VERSION = 'zuno-0.6';
+const VERSION = 'zuno-0.9';
 const SHELL = [
   './',
   './index.html',

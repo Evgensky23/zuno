@@ -3,16 +3,16 @@
 
   const KEY = 'zuno.v1';
   const OLD_KEY = 'tally.v1'; // data saved before the rename
-  const VERSION = '0.6';
+  const VERSION = '0.9';
   const DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const DOW_LONG = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   const DOW1 = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
   const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
     'August', 'September', 'October', 'November', 'December'];
   const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
-  const DEFAULT_SETTINGS = { weekStart: 'mon', streaks: true, doneLast: false };
+  const DEFAULT_SETTINGS = { weekStart: 'mon', streaks: true, doneLast: false, aiStats: false, scheme: 'classic' };
 
-  // Left rail: sections and their sub-sections ([id, full label, short label for the narrow rail]).
+  // Sections and their pages ([id, full label, short label for narrow screens]), shown as pills under the top bar.
   const NAV = [
     { id: 'today', label: 'Progress', subs: [
       ['day', 'Today', 'Today'],
@@ -29,6 +29,10 @@
       ['add', 'Add new habit', 'Add new'],
       ['change', 'Change current habits', 'Change'],
       ['list', 'Your habits', 'Your habits'],
+    ] },
+    { id: 'notebook', label: 'Notebook', subs: [
+      ['notes', 'Notes', 'Notes'],
+      ['ask', 'Ask Zuno', 'Ask Zuno'],
     ] },
   ];
 
@@ -92,7 +96,8 @@
 
   function empty() {
     return { v: 1, theme: null, settings: { ...DEFAULT_SETTINGS },
-      categories: DEFAULT_CATS.map(c => ({ ...c })), habits: [], log: {}, skips: {}, rest: {} };
+      categories: DEFAULT_CATS.map(c => ({ ...c })), habits: [], log: {}, skips: {}, rest: {},
+      notes: [], chat: { items: [] } };
   }
   const blank = () => ({ ...empty(), theme: state.theme, settings: state.settings });
 
@@ -102,6 +107,8 @@
     settings: { ...DEFAULT_SETTINGS, ...(s.settings || {}) },
     skips: s.skips || {},
     rest: s.rest || {},
+    notes: Array.isArray(s.notes) ? s.notes : [],
+    chat: s.chat && Array.isArray(s.chat.items) ? s.chat : { items: [] },
     habits: s.habits.map(h => ({ mode: 'days', times: 3, pauses: [], archived: null, ...h })),
   });
 
@@ -121,7 +128,7 @@
 
   const ui = {
     view: 'today',
-    sub: { today: 'day', stats: 'overview', habits: 'add' },
+    sub: { today: 'day', stats: 'overview', habits: 'add', notebook: 'notes' },
     date: today(),
     range: 30,
     rep: { week: 0, month: 0 },
@@ -130,6 +137,12 @@
     err: '',
     note: '',
     pop: null,
+    noteId: null,
+    noteEdit: false,
+    sel: {},
+    ai: { busy: false, text: '', err: '' },
+    draft: '',
+    keyEdit: false,
   };
 
   // ---- queries ----
@@ -178,45 +191,79 @@
     return { done: hs.filter(h => isDone(h, d)).length, total: hs.length };
   }
 
-  // Streaks: days in a row for day habits, weeks in a row for weekly ones.
-  // Skipped, rest and paused days neither add to a streak nor break it.
-  function streaks(h) {
-    const t = today();
-    if (h.mode === 'weekly') {
-      const status = [];
-      const cur = weekStartOf(t);
-      for (let w = weekStartOf(h.created); w <= cur; w = addDays(w, 7)) {
-        let cnt = 0, avail = 0;
-        for (let i = 0; i < 7; i++) {
-          const x = addDays(w, i);
-          if (x < h.created || !listed(h, x)) continue;
-          if (isDone(h, x)) cnt++;
-          if (x > t || open(h, x)) avail++;
-        }
-        const target = Math.min(h.times, Math.max(avail, cnt));
-        status.push(!target ? 'skip' : cnt >= target ? 'met' : w === cur ? 'skip' : 'fail');
-      }
-      let now = 0, best = 0, run = 0;
-      for (const s of status) { if (s === 'met') best = Math.max(best, ++run); else if (s === 'fail') run = 0; }
-      for (let i = status.length - 1; i >= 0; i--) { if (status[i] === 'met') now++; else if (status[i] === 'fail') break; }
-      return { now, best, unit: 'w' };
+  // ---- streaks (the fire) ----
+  // A missed day only breaks a streak once it is fully over: at 3 am the next morning.
+  // So today is always still open, and so is yesterday until 3 am.
+  const openFrom = () => (new Date().getHours() < 3 ? addDays(today(), -1) : today());
+  const neutralDay = (h, d) => isPaused(h, d) || isRest(d) || isSkipped(h, d);
+
+  // How many times in a row this habit was done.
+  // Set days: days it isn't set for don't matter; a missed set day ends the streak.
+  // X times a week: up to 8 - X missed days in a row are allowed; one more ends it.
+  // Skipped, rest and paused days never count as missed.
+  function habitStreak(h) {
+    const from = openFrom();
+    const gap = h.mode === 'weekly' ? 8 - h.times : 0;
+    let count = 0, missed = 0;
+    for (let d = today(), i = 0; d >= h.created && i < 3660; d = addDays(d, -1), i++) {
+      if (h.mode !== 'weekly' && !h.days.includes(dow(d))) continue;
+      if (isDone(h, d)) { count++; missed = 0; continue; }
+      if (neutralDay(h, d) || d >= from) continue;
+      if (++missed > gap) break;
     }
-    let d = t;
-    if (!isDone(h, d)) d = addDays(d, -1); // today isn't over yet
-    let now = 0;
-    for (let i = 0; i < 3660 && d >= h.created; i++, d = addDays(d, -1)) {
-      if (!due(h, d)) continue;
-      if (isDone(h, d)) now++; else break;
-    }
-    let best = 0, run = 0;
-    for (let x = h.created; x <= t; x = addDays(x, 1)) {
-      if (!due(h, x)) continue;
-      if (isDone(h, x)) best = Math.max(best, ++run);
-      else if (x !== t) run = 0;
-    }
-    return { now, best, unit: 'd' };
+    return count;
   }
-  const streakText = s => (s.unit === 'w' ? `${s.now} ${s.now === 1 ? 'week' : 'weeks'} in a row` : `${s.now} in a row`);
+
+  // Days in a row with at least half of the day's due habits done.
+  // Rest days and days with nothing planned count too; the streak starts with the first habit.
+  function dayStreak() {
+    if (!state.habits.length) return 0;
+    const first = state.habits.reduce((m, h) => (h.created < m ? h.created : m), today());
+    const from = openFrom();
+    let count = 0;
+    for (let d = today(); d >= first; d = addDays(d, -1)) {
+      const s = dayScore(d);
+      if (isRest(d) || !s.total || s.done * 2 >= s.total) { count++; continue; }
+      if (d >= from) continue;
+      break;
+    }
+    return count;
+  }
+
+  const FLAME = '<path d="M12 2.5c.7 3.1 3.3 4.8 4.6 7.4 1.8 3.7-.2 9-4.6 9.6-4.5.5-7.3-3-6.4-6.9.4-1.8 1.5-3.1 2.7-4 .1 1.6.7 2.8 1.9 3.4-.6-3.4.5-6.8 1.8-9.5z" fill="url(#zuno-flame)"/>';
+  const fire = (n, title) => `<span class="fire ${n ? '' : 'off'}" title="${title}"><svg viewBox="0 0 24 24" aria-hidden="true">${FLAME}</svg>${n}</span>`;
+  const habitFire = h => { const n = habitStreak(h); return fire(n, `${n} in a row`); };
+
+  // ---- category icons and colors ----
+  const CAT_STYLE = {
+    sport: ['red', '<path d="M6.5 8v8M17.5 8v8M3.5 10v4M20.5 10v4M6.5 12h11"/>'],
+    health: ['pink', '<path d="M12 19s-7-4.3-7-9.1A3.9 3.9 0 0 1 12 7.6a3.9 3.9 0 0 1 7 2.3C19 14.7 12 19 12 19z"/>'],
+    diet: ['green', '<path d="M12 8.2c-3-1.6-6.6.4-6.6 4.4S8 20 10 20c1 0 1.3-.5 2-.5s1 .5 2 .5c2 0 4.6-3.4 4.6-7.4S15 6.6 12 8.2z"/><path d="M12 8.2c0-2.1 1-3.6 3-4.2"/>'],
+    education: ['blue', '<path d="M12 7c-2-1.4-5-1.9-8-1.4v12.5c3-.5 6 0 8 1.4 2-1.4 5-1.9 8-1.4V5.6C17 5.1 14 5.6 12 7zM12 7v12.5"/>'],
+    religion: ['indigo', '<path d="M12 3.5l1.9 5.6 5.6 1.9-5.6 1.9L12 18.5l-1.9-5.6L4.5 11l5.6-1.9z"/>'],
+    mind: ['teal', '<circle cx="12" cy="12" r="7"/><path d="M8.8 12.6c1.1 1.1 2.1 1.1 3.2 0s2.1-1.1 3.2 0"/>'],
+    sleep: ['purple', '<path d="M18.5 14.6A7 7 0 0 1 9.4 5.5a7 7 0 1 0 9.1 9.1z"/>'],
+    work: ['gray', '<rect x="4" y="8" width="16" height="11" rx="2"/><path d="M9 8V6.5A1.5 1.5 0 0 1 10.5 5h3A1.5 1.5 0 0 1 15 6.5V8M4 13h16"/>'],
+    social: ['orange', '<circle cx="9" cy="9" r="3"/><path d="M4 19c0-3 2.2-5 5-5s5 2 5 5"/><circle cx="17" cy="10" r="2.3"/><path d="M15.6 14.3c2.6-.4 4.4 1.4 4.4 4.2"/>'],
+    finance: ['yellow', '<circle cx="12" cy="12" r="7.5"/><path d="M14.5 9.6c-.5-.8-1.4-1.2-2.5-1.2-1.5 0-2.5.8-2.5 1.9 0 2.6 5 1.3 5 3.9 0 1.1-1 1.9-2.5 1.9-1.2 0-2.1-.5-2.6-1.3M12 7v1.4M12 15.6V17"/>'],
+  };
+  const COLOR_ORDER = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'indigo', 'purple', 'pink', 'gray'];
+  // Categories you add yourself get a color picked from their name, so it never changes.
+  function catStyle(id) {
+    if (CAT_STYLE[id]) return CAT_STYLE[id];
+    let h = 0;
+    for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    return [COLOR_ORDER[h % COLOR_ORDER.length], '<circle cx="12" cy="12" r="3.2"/><circle cx="12" cy="12" r="7.5"/>'];
+  }
+  const catColor = id => `var(--c-${catStyle(id)[0]})`;
+  const catIcon = id => `<span class="cat-ic" style="--cc:${catColor(id)}"><svg viewBox="0 0 24 24" aria-hidden="true">${catStyle(id)[1]}</svg></span>`;
+
+  const SCHEMES = [
+    ['classic', 'Classic', 'Black and white'],
+    ['vivid', 'Vivid', 'Bright colors, like iOS'],
+    ['soft', 'Soft', 'Muted pastels'],
+    ['earth', 'Earth', 'Greens and warm tones'],
+  ];
 
   function habitPeriod(h, from, to) {
     let done = 0, total = 0;
@@ -284,7 +331,8 @@
         <div class="daynav">
           <div class="date">
             <span class="k">${label}</span>
-            <span class="v">${dd.getDate()} ${MONTHS[dd.getMonth()]} ${dd.getFullYear() !== new Date().getFullYear() ? dd.getFullYear() : ''}</span>
+            <span class="v">${dd.getDate()} ${MONTHS[dd.getMonth()]} ${dd.getFullYear() !== new Date().getFullYear() ? dd.getFullYear() : ''}
+              ${state.habits.length ? fire(dayStreak(), 'Days in a row with at least half of your habits done') : ''}</span>
           </div>
           <div class="arrows">
             <button class="arrow" data-act="shift" data-n="-1" aria-label="Previous day">←</button>
@@ -331,7 +379,7 @@
       let meta = '';
       if (skipped) meta = 'Skipped';
       else if (weekly) meta = met ? 'Done for the week' : `${wk}/${h.times} this week`;
-      else if (showStreaks) { const s = streaks(h); if (s.now > 1) meta = streakText(s); }
+      if (showStreaks && !skipped) { const n = habitStreak(h); if (n) meta += (meta ? ' ' : '') + fire(n, `${n} in a row`); }
       return `<div class="habit ${done ? 'done' : ''} ${skipped ? 'skipped' : ''} ${met ? 'met' : ''} ${ui.pop === h.id ? 'pop' : ''}">
         <button class="hmain" data-act="toggle" data-id="${h.id}" aria-pressed="${done}">
           <span class="box"></span>
@@ -349,7 +397,7 @@
       const due_ = list.filter(h => due(h, d)).length;
       if (state.settings.doneLast) list = [...list.filter(h => !isDone(h, d)), ...list.filter(h => isDone(h, d))];
       return `<section class="group">
-        <header><h3>${esc(c.name)}</h3><span class="frac">${k}/${due_}</span></header>
+        <header><h3>${catIcon(c.id)}${esc(c.name)}</h3><span class="frac">${k}/${due_}</span></header>
         ${list.map(row).join('')}
       </section>`;
     }).join('');
@@ -481,8 +529,8 @@
     const dl = (now, before) => (before == null ? '' : now === before ? '±0' : `${now > before ? '+' : '−'}${Math.abs(now - before)}`);
     const cats = cur.perCat.sort((a, b2) => b2.done / b2.total - a.done / a.total).map(x => `
       <div class="brow">
-        <span>${esc(x.c.name)}</span>
-        <span class="bar"><b style="width:${pct(x.done, x.total)}%"></b></span>
+        <span class="cn">${catIcon(x.c.id)}${esc(x.c.name)}</span>
+        <span class="bar" style="--cc:${catColor(x.c.id)}"><b style="width:${pct(x.done, x.total)}%"></b></span>
         <span class="num">${dl(pct(x.done, x.total), prevCat.get(x.c.id))}</span>
         <span class="num strong">${pct(x.done, x.total)}%</span>
       </div>`).join('');
@@ -559,20 +607,18 @@
 
   function viewByHabit() {
     const R = ui.range;
-    const rows = state.habits.map(h => ({ h, ...habitRange(h, R), s: streaks(h) }))
+    const rows = state.habits.map(h => ({ h, ...habitRange(h, R) }))
       .filter(x => x.total || !x.h.archived)
       .sort((a, b) => pct(b.done, b.total) - pct(a.done, a.total));
-    const u = s => (s.unit === 'w' ? 'w' : '');
     const body = `
-      <div class="card list" style="margin-top:16px"><div class="trow head"><span></span><span class="th">Rate</span><span class="th">Now</span><span class="th">Best</span></div>
+      <div class="card list" style="margin-top:16px"><div class="trow head"><span></span><span class="th">Rate</span><span class="th">Streak</span></div>
       ${rows.map(x => `<div class="trow">
         <span class="nm">${esc(x.h.name)}<small>${esc(catName(x.h.cat))} · ${x.done}/${x.total}${statusLabel(x.h) ? ' · ' + statusLabel(x.h) : ''}</small>
           <span class="mbar"><b style="width:${pct(x.done, x.total)}%"></b></span></span>
         <span class="num strong">${x.total ? pct(x.done, x.total) + '%' : '—'}</span>
-        <span class="num">${x.s.now}${u(x.s)}</span>
-        <span class="num">${x.s.best}${u(x.s)}</span>
+        <span class="num">${habitFire(x.h)}</span>
       </div>`).join('')}
-      </div><div class="foot">Now = current streak · Best = longest streak ever · w = weeks, for weekly habits</div>`;
+      </div><div class="foot">Streak = times done in a row. A missed day ends it at 3 am the next morning; days a habit isn’t set for, and skipped, rest or paused days, don’t count as missed. “X times a week” habits can miss up to 8 − X days in a row.</div>`;
     return pageHead('Stats', 'By habit') + (state.habits.length ? rangeBar() + body : noHabits());
   }
 
@@ -586,8 +632,8 @@
 
     const body = `<div class="card list" style="margin-top:16px">${cats.map(x => `
       <div class="brow">
-        <span>${esc(x.c.name)}</span>
-        <span class="bar"><b style="width:${pct(x.done, x.total)}%"></b></span>
+        <span class="cn">${catIcon(x.c.id)}${esc(x.c.name)}</span>
+        <span class="bar" style="--cc:${catColor(x.c.id)}"><b style="width:${pct(x.done, x.total)}%"></b></span>
         <span class="num">${x.done}/${x.total}</span>
         <span class="num strong">${pct(x.done, x.total)}%</span>
       </div>
@@ -774,7 +820,7 @@
       const hs = live.filter(h => h.cat === c.id);
       if (!hs.length) return '';
       return `<section class="group">
-        <header><h3>${esc(c.name)}</h3><span class="frac">${hs.length}</span></header>
+        <header><h3>${catIcon(c.id)}${esc(c.name)}</h3><span class="frac">${hs.length}</span></header>
         <div class="sortlist" data-sort-kind="habits">${hs.map(h => itemRow(h, true)).join('')}</div>
       </section>`;
     }).join('');
@@ -791,7 +837,7 @@
         const k = counts(c.id);
         return `<div class="item" data-sort data-id="${c.id}">
           <button class="handle" data-id="${c.id}" aria-label="Move ${esc(c.name)}. Use arrow keys or drag." title="Drag to reorder"></button>
-          <span class="iname static">${esc(c.name)}</span>
+          <span class="iname static">${catIcon(c.id)}${esc(c.name)}</span>
           ${k ? `<span class="sched">${k}</span>` : `<button class="x" data-act="delCat" data-id="${c.id}" aria-label="Remove ${esc(c.name)}">×</button>`}
         </div>`;
       }).join('')}</div>
@@ -823,12 +869,11 @@
         const d = addDays(t, -i);
         strip += `<i class="${isDone(h, d) ? 'on' : due(h, d) ? '' : 'na'}"></i>`;
       }
-      const s = streaks(h);
       const status = statusLabel(h);
       return `<button class="hrow" data-act="editFrom" data-id="${h.id}">
         <span class="nm">${esc(h.name)}<small>${schedLabel(h)} · since ${shortDate(h.created)}${status ? ' · ' + status : ''}</small></span>
         <span class="rt"><span class="strip" title="Last 14 days">${strip}</span>
-          <span class="streak">${s.now ? streakText(s) : 'No streak'}</span></span>
+          <span class="streak">${habitFire(h)}</span></span>
       </button>`;
     };
 
@@ -836,7 +881,7 @@
       const hs = live.filter(h => h.cat === c.id);
       if (!hs.length) return '';
       return `<section class="group">
-        <header><h3>${esc(c.name)}</h3><span class="frac">${hs.length}</span></header>
+        <header><h3>${catIcon(c.id)}${esc(c.name)}</h3><span class="frac">${hs.length}</span></header>
         ${hs.map(row).join('')}
       </section>`;
     }).join('');
@@ -847,6 +892,380 @@
       </section>` : '';
     return pageHead('Habits', 'Your habits') + summary + groups + arch +
       `<div class="foot">Squares show the last 14 days: filled = done, grey = missed, outlined = not due (skipped, paused, rest day or not planned).</div>`;
+  }
+
+  // ---- notebook ----
+  // A note: { id, title, body (markdown), created, updated, source: 'me' | 'ai', habits: [suggestion] | null }
+
+  // Small, safe markdown renderer for notes and AI replies: headings, lists, bold, italic, code, rules.
+  function md(src) {
+    const inline = s => s
+      .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+      .replace(/(^|[^*])\*(?!\s)(.+?)\*/g, '$1<i>$2</i>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
+    let html = '', list = null;
+    const close = () => { if (list) { html += `</${list}>`; list = null; } };
+    for (const raw of esc(src || '').split('\n')) {
+      const l = raw.trimEnd();
+      let m;
+      if (!l.trim()) { close(); continue; }
+      if ((m = l.match(/^(#{1,4})\s+(.*)/))) { close(); const lv = Math.min(5, m[1].length + 2); html += `<h${lv}>${inline(m[2])}</h${lv}>`; continue; }
+      if (/^\s*(-{3,}|\*{3,})\s*$/.test(l)) { close(); html += '<hr>'; continue; }
+      if ((m = l.match(/^\s*[-*•]\s+(.*)/))) { if (list !== 'ul') { close(); html += '<ul>'; list = 'ul'; } html += `<li>${inline(m[1])}</li>`; continue; }
+      if ((m = l.match(/^\s*\d+[.)]\s+(.*)/))) { if (list !== 'ol') { close(); html += '<ol>'; list = 'ol'; } html += `<li>${inline(m[1])}</li>`; continue; }
+      close();
+      html += `<p>${inline(l)}</p>`;
+    }
+    close();
+    return html;
+  }
+  // Markdown to one line of plain text: drop heading/list markers and emphasis, keep hyphens inside words.
+  const plain = s => (s || '').replace(/^\s*(#{1,6}|[-*•]|\d+[.)])\s+/gm, '').replace(/[*`>_]+/g, '').replace(/\s+/g, ' ').trim();
+  const noteTitle = n => n.title.trim() || plain(n.body).slice(0, 48) || 'Untitled note';
+  const findNote = id => state.notes.find(n => n.id === id);
+
+  function newNote(fields = {}) {
+    const now = new Date().toISOString();
+    const n = { id: uid(), title: '', body: '', created: now, updated: now, source: 'me', habits: null, ...fields };
+    state.notes.unshift(n);
+    save();
+    return n;
+  }
+  // Leaving a note that was never written in removes it again.
+  function leaveNote() {
+    const n = findNote(ui.noteId);
+    if (n && !n.title.trim() && !n.body.trim()) { state.notes = state.notes.filter(x => x !== n); save(); }
+    ui.noteId = null;
+    ui.noteEdit = false;
+  }
+
+  // Suggested habits (from the AI) with one-tap add. `key` scopes the checkbox state.
+  function suggestions(key, list, added) {
+    if (!list || !list.length) return '';
+    const existing = new Set(state.habits.map(h => h.name.trim().toLowerCase()));
+    const sel = ui.sel[key] || (ui.sel[key] = list.map(h => !existing.has(h.name.toLowerCase())));
+    const count = list.filter((h, i) => sel[i] && !existing.has(h.name.toLowerCase())).length;
+    return `<div class="sugg">
+      <div class="sugg-h"><b>Suggested habits</b><span class="frac">${list.length}</span></div>
+      ${list.map((h, i) => {
+        const have = existing.has(h.name.toLowerCase());
+        return `<button class="sugg-row ${sel[i] && !have ? 'on' : ''} ${have ? 'have' : ''}" data-act="suggToggle" data-k="${key}" data-i="${i}" ${have || added ? 'disabled' : ''}>
+          <span class="box"></span>
+          <span class="nm">${esc(h.name)}<small>${esc(catName(h.cat))} · ${schedLabel(h)}${have ? ' · already in Zuno' : ''}</small></span>
+        </button>`;
+      }).join('')}
+      <div class="sugg-f">${added
+        ? '<span class="lbl">Added to your habits</span><button class="linkbtn" data-view="today" data-sub="day">Open Today →</button>'
+        : `<button class="btn primary" data-act="suggAdd" data-k="${key}" ${count ? '' : 'disabled'}>Add ${count} ${count === 1 ? 'habit' : 'habits'}</button>`}</div>
+    </div>`;
+  }
+
+  function addSuggested(key, list) {
+    const sel = ui.sel[key] || [];
+    const existing = new Set(state.habits.map(h => h.name.trim().toLowerCase()));
+    let n = 0;
+    list.forEach((h, i) => {
+      if (!sel[i] || existing.has(h.name.toLowerCase())) return;
+      state.habits.push({ id: uid(), name: h.name, cat: h.cat, mode: h.mode, times: h.times, days: [...h.days],
+        created: today(), pauses: [], archived: null });
+      n++;
+    });
+    return n;
+  }
+
+  function viewNotes() {
+    if (ui.noteId && findNote(ui.noteId)) return viewNote(findNote(ui.noteId));
+    const notes = [...state.notes].sort((a, b) => (a.updated < b.updated ? 1 : -1));
+    const list = notes.length ? `<div class="notes">${notes.map(n => `
+      <button class="note-card" data-act="openNote" data-id="${n.id}">
+        <span class="nt">${esc(noteTitle(n))}</span>
+        <span class="ns">${esc(plain(n.body).slice(0, 140)) || '&nbsp;'}</span>
+        <span class="nm">${shortDate(n.updated.slice(0, 10))}${n.source === 'ai' ? ' · From Ask Zuno' : ''}${n.habits && n.habits.length ? ` · ${n.habits.length} habits` : ''}</span>
+      </button>`).join('')}</div>`
+      : `<div class="empty"><p>Your notebook is empty.</p>Write down meal ideas, workouts or thoughts, or
+        <button data-view="notebook" data-sub="ask">ask Zuno for a plan →</button></div>`;
+    return pageHead('Notebook', 'Notes') + `
+      <div class="actions" style="margin-top:12px">
+        <button class="btn primary" data-act="newNote">New note</button>
+        <button class="btn" data-view="notebook" data-sub="ask">Ask Zuno</button>
+      </div>` + list;
+  }
+
+  function viewNote(n) {
+    const back = `<button class="backlink" data-act="closeNote">← All notes</button>`;
+    if (ui.noteEdit) {
+      return back + `
+        <section class="note-edit">
+          <input type="text" id="n-title" class="n-title" placeholder="Title" value="${esc(n.title)}" maxlength="80" autocomplete="off">
+          <textarea id="n-body" class="n-body" placeholder="Write here. Use # for headings and - for lists.">${esc(n.body)}</textarea>
+          <div class="actions">
+            <button class="btn primary" data-act="noteDone">Done</button>
+            <button class="btn ghost right" data-act="delNote">Delete</button>
+          </div>
+        </section>`;
+    }
+    return back + `
+      <article class="note-read">
+        <h2>${esc(noteTitle(n))}</h2>
+        <div class="nm">${n.source === 'ai' ? 'From Ask Zuno · ' : ''}Edited ${shortDate(n.updated.slice(0, 10))}</div>
+        <div class="md">${md(n.body) || '<p class="lbl">Empty note.</p>'}</div>
+        ${suggestions('note-' + n.id, n.habits, n.added)}
+        <div class="actions" style="margin-top:18px">
+          <button class="btn" data-act="noteEdit">Edit</button>
+          <button class="btn ghost right" data-act="delNote">Delete</button>
+        </div>
+      </article>`;
+  }
+
+  // ---- ask zuno (Claude, with the person's own API key) ----
+  const AI_KEY = 'zuno.ai.key';
+  const AI_MODEL = 'claude-opus-5-5';
+  const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.1.0/+esm';
+  const aiKey = () => { try { return localStorage.getItem(AI_KEY) || ''; } catch (e) { return ''; } };
+  let sdk = null;
+
+  const STARTERS = [
+    ['Meal plan', 'Make me a 7-day meal plan. My goal: '],
+    ['Training plan', 'Make me a training plan. My goal: '],
+    ['Build a routine', 'Help me build a daily routine for '],
+    ['Review my progress', 'Look at my habits and tell me what to change to stay more consistent.'],
+  ];
+
+  function systemPrompt() {
+    const t = parse(today());
+    return `You are the assistant inside Zuno, a habit-tracking app. People use you to plan the things they want to turn into habits: meal plans, training plans, study, prayer or sleep routines and similar.
+
+How to answer:
+- Before writing a meal or training plan, make sure you know the goal, the person's current level and weekly schedule, and any allergies, dietary rules, injuries or medical conditions. If something important is missing, ask for it in one short message with at most four questions, then wait. If they already gave enough, or ask you to just go ahead, write the plan with sensible assumptions and say what you assumed.
+- Plans are general guidance, not medical advice; say so once, in one short line. If someone mentions a medical condition, pregnancy, an eating disorder or an injury, keep the advice conservative and suggest checking with a doctor, dietitian or physiotherapist.
+- Your answer is read on a phone. Use short headings (##), bullet lists and bold for key numbers. No tables and no emojis. Keep it as short as the request allows.
+- When a plan or routine involves things to do regularly, call suggest_habits with 1 to 6 habits that capture it, after writing the plan. Each habit is a short, checkable action. Match the plan's schedule: mode "days" with the weekdays, or mode "weekly" with a number of times per week when any days will do. Skip habits the person already has, if you know them.
+- Reply in the language the person writes in.
+
+Today is ${DOW_LONG[dow(today())]}, ${t.getDate()} ${MONTHS[t.getMonth()]} ${t.getFullYear()}.`;
+  }
+
+  function habitTool() {
+    return {
+      name: 'suggest_habits',
+      description: 'Show the person habits they can add to Zuno with one tap. Call it after writing a plan or routine that involves regular actions.',
+      strict: true,
+      eager_input_streaming: true,
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['habits'],
+        properties: {
+          habits: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['name', 'category', 'mode', 'days', 'times'],
+              properties: {
+                name: { type: 'string', description: 'Short action, at most 40 characters, e.g. "Run 5 km" or "Protein with breakfast"' },
+                category: { type: 'string', enum: state.categories.map(c => c.name), description: 'The Zuno category it belongs to' },
+                mode: { type: 'string', enum: ['days', 'weekly'], description: '"days" for fixed weekdays, "weekly" for a number of times per week on any days' },
+                days: { type: 'array', items: { type: 'integer' }, description: 'For mode "days": weekdays, 0 = Monday to 6 = Sunday. Empty for "weekly".' },
+                times: { type: 'integer', description: 'For mode "weekly": times per week, 1 to 7. 0 for "days".' },
+              },
+            },
+          },
+        },
+      },
+    };
+  }
+
+  // Tool input arrives via eager streaming and isn't validated by the API, so check every field here.
+  function cleanHabits(input) {
+    if (!input || !Array.isArray(input.habits)) return [];
+    return input.habits.filter(h => h && typeof h.name === 'string' && h.name.trim()).slice(0, 8).map(h => {
+      const cat = state.categories.find(c => c.name.toLowerCase() === String(h.category || '').toLowerCase()) || state.categories[0];
+      const weekly = h.mode === 'weekly';
+      const days = [...new Set((Array.isArray(h.days) ? h.days : []).filter(d => Number.isInteger(d) && d >= 0 && d <= 6))].sort();
+      return {
+        name: h.name.trim().slice(0, 60),
+        cat: cat ? cat.id : '',
+        mode: weekly ? 'weekly' : 'days',
+        days: weekly || !days.length ? [...ALL_DAYS] : days,
+        times: weekly ? Math.min(7, Math.max(1, Number.isInteger(h.times) && h.times > 0 ? h.times : 3)) : 3,
+      };
+    }).filter(h => h.cat);
+  }
+
+  // What gets shared when "Use my habit stats" is on.
+  function statsContext() {
+    const t = today();
+    const live = state.habits.filter(h => !h.archived);
+    const lines = live.map(h => {
+      const r = habitRange(h, 30);
+      return `- ${h.name} · ${catName(h.cat)} · ${schedLabel(h)} · last 30 days ${r.done}/${r.total}${r.total ? ` (${pct(r.done, r.total)}%)` : ''} · done ${habitStreak(h)} times in a row${isPaused(h, t) ? ' · paused' : ''}`;
+    });
+    let done = 0, total = 0;
+    for (let i = 0; i < 30; i++) { const s = dayScore(addDays(t, -i)); done += s.done; total += s.total; }
+    return `<zuno_context>
+Shared by the person from their Zuno tracker.
+${lines.length ? `Habits:\n${lines.join('\n')}` : 'No habits yet.'}
+All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : ''}.
+</zuno_context>`;
+  }
+
+  function aiError(err) {
+    const A = sdk && sdk.default;
+    if (A && err instanceof A.APIUserAbortError) return 'Stopped.';
+    if (A && err instanceof A.AuthenticationError) return 'Anthropic rejected the API key. Check it under “Key” below.';
+    if (A && err instanceof A.PermissionDeniedError) return 'This API key isn’t allowed to use Claude. Check your Anthropic account.';
+    if (A && err instanceof A.RateLimitError) return 'Too many requests right now. Wait a minute and try again.';
+    if (A && err instanceof A.BadRequestError) return `Anthropic couldn’t take this request: ${err.message}`;
+    if (A && err instanceof A.InternalServerError) return 'Anthropic’s service had a problem. Try again in a moment.';
+    if (A && err instanceof A.APIConnectionError) return 'Couldn’t reach Anthropic. Check your internet connection.';
+    if (A && err instanceof A.APIError) return `Something went wrong (${err.status || 'error'}). Try again.`;
+    return 'Couldn’t reach Anthropic. Check your internet connection.';
+  }
+
+  async function askZuno(text) {
+    if (!text.trim() || ui.ai.busy || !aiKey()) return;
+    const items = state.chat.items;
+    const content = [];
+    // The previous answer may have called suggest_habits; the API expects a result for each call.
+    const last = items[items.length - 1];
+    if (last && last.role === 'assistant') {
+      for (const b of last.content) {
+        if (b.type === 'tool_use') content.push({ type: 'tool_result', tool_use_id: b.id, content: 'Shown to the person as one-tap habit suggestions.' });
+      }
+    }
+    if (state.settings.aiStats) content.push({ type: 'text', text: statsContext() });
+    content.push({ type: 'text', text: text.trim() });
+    items.push({ role: 'user', content, text: text.trim(), stats: !!state.settings.aiStats });
+    ui.draft = '';
+    ui.ai = { busy: true, text: '', err: '', stream: null };
+    save();
+    render();
+    scrollToEnd(true);
+
+    try {
+      if (!sdk) sdk = await import(SDK_URL);
+      const Anthropic = sdk.default;
+      const client = new Anthropic({ apiKey: aiKey(), dangerouslyAllowBrowser: true });
+      const stream = client.beta.messages.stream({
+        model: AI_MODEL,
+        max_tokens: 64000,
+        betas: ['server-side-fallback-2026-07-01'],
+        fallbacks: 'default', // if Opus declines, Anthropic retries on its recommended model
+        output_config: { effort: 'medium' },
+        system: systemPrompt(),
+        tools: [habitTool()],
+        messages: items.map(i => ({ role: i.role, content: i.content })),
+      });
+      ui.ai.stream = stream;
+      stream.on('text', delta => { ui.ai.text += delta; paintLive(); });
+      const msg = await stream.finalMessage();
+
+      if (msg.stop_reason === 'refusal') {
+        items.pop();
+        ui.draft = text;
+        ui.ai = { busy: false, text: '', err: 'Zuno’s assistant can’t help with that request. Try rephrasing it.' };
+      } else {
+        const reply = msg.content.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
+        const call = msg.content.find(b => b.type === 'tool_use' && b.name === 'suggest_habits');
+        items.push({
+          role: 'assistant',
+          content: msg.content, // kept whole and sent back unchanged on the next turn
+          text: reply,
+          habits: call ? cleanHabits(call.input) : [],
+          cut: msg.stop_reason === 'max_tokens',
+        });
+        ui.ai = { busy: false, text: '', err: '' };
+      }
+    } catch (err) {
+      items.pop(); // nothing was answered, so take the question back out of the history
+      ui.draft = text;
+      ui.ai = { busy: false, text: '', err: aiError(err) };
+    }
+    save();
+    if (ui.view === 'notebook' && ui.sub.notebook === 'ask') { render(); scrollToEnd(); }
+  }
+
+  function scrollToEnd(force) {
+    const nearEnd = window.innerHeight + window.scrollY >= document.body.scrollHeight - 200;
+    if (force || nearEnd) window.scrollTo({ top: document.body.scrollHeight });
+  }
+  function paintLive() {
+    const el = document.getElementById('ai-live');
+    if (!el) return;
+    el.innerHTML = md(ui.ai.text);
+    el.classList.remove('waiting');
+    scrollToEnd();
+  }
+
+  function viewAsk() {
+    const head = pageHead('Notebook', 'Ask Zuno');
+    if (!aiKey() || ui.keyEdit) return head + keyCard();
+    const items = state.chat.items;
+
+    const thread = items.map((it, idx) => it.role === 'user'
+      ? `<div class="msg me">${esc(it.text)}${it.stats ? '<small>Habit stats shared</small>' : ''}</div>`
+      : `<div class="msg ai">
+          <div class="md">${md(it.text) || '<p class="lbl">Suggested habits below.</p>'}</div>
+          ${it.cut ? '<p class="lbl">The answer was cut off. Ask Zuno to continue.</p>' : ''}
+          ${suggestions('chat-' + idx, it.habits, it.added)}
+          <div class="msg-actions">
+            ${it.noteId && findNote(it.noteId)
+              ? `<button class="linkbtn" data-act="openNote" data-id="${it.noteId}">Saved in Notes →</button>`
+              : `<button class="linkbtn" data-act="saveReply" data-i="${idx}">Save to notebook</button>`}
+          </div>
+        </div>`).join('');
+
+    const live = ui.ai.busy ? `<div class="msg ai"><div class="md ${ui.ai.text ? '' : 'waiting'}" id="ai-live">${ui.ai.text ? md(ui.ai.text) : '<span class="dots"><i></i><i></i><i></i></span> Thinking'}</div></div>` : '';
+
+    const intro = items.length ? '' : `
+      <p class="summary">Ask for a meal plan, a training plan or a routine. Zuno writes it up and offers the parts worth tracking as habits you can add with one tap.</p>
+      <div class="starters">${STARTERS.map(([label], i) => `<button data-act="starter" data-i="${i}">${label}</button>`).join('')}</div>`;
+
+    const s = state.settings.aiStats;
+    const composer = `
+      <div class="composer">
+        ${ui.ai.err ? `<div class="err">${esc(ui.ai.err)}</div>` : ''}
+        <textarea id="ai-input" rows="2" placeholder="Ask Zuno…" ${ui.ai.busy ? 'disabled' : ''}>${esc(ui.draft)}</textarea>
+        <div class="composer-row">
+          <button class="chipbtn ${s ? 'on' : ''}" data-act="aiStats" aria-pressed="${!!s}" title="Send a summary of your habits and last 30 days with your next questions">
+            <span class="sw ${s ? 'on' : ''}"><i></i></span>Use my habit stats</button>
+          ${ui.ai.busy
+            ? '<button class="btn" data-act="aiStop">Stop</button>'
+            : '<button class="btn primary" data-act="aiSend">Send</button>'}
+        </div>
+      </div>`;
+
+    const tools = `<div class="ask-foot">
+      ${items.length ? '<button class="linkbtn" data-act="aiNew">New conversation</button>' : '<span></span>'}
+      <button class="linkbtn" data-act="keyEdit">Key</button>
+    </div>`;
+
+    return head + intro + `<div class="thread">${thread}${live}</div>` + composer + tools +
+      `<div class="foot">Answers come from Claude by Anthropic, using your own API key. What you send here goes to Anthropic; your other data stays on this device. Plans are general guidance, not medical advice.</div>`;
+  }
+
+  function keyCard() {
+    const has = !!aiKey();
+    return `
+      <section class="editor">
+        <p class="summary" style="padding-top:0">Ask Zuno uses Claude, Anthropic’s AI. It needs your own Anthropic API key. The key is saved only on this device and is sent only to Anthropic.</p>
+        <ol class="steps">
+          <li>Sign in at <b>console.anthropic.com</b> and add some credit under Billing. A typical plan costs a few cents.</li>
+          <li>Open <b>API keys</b> and create a key.</li>
+          <li>Paste it below.</li>
+        </ol>
+        <div class="field">
+          <span class="lbl">API key</span>
+          <input type="password" id="ai-key" placeholder="${has ? 'Saved. Paste a new key to replace it' : 'sk-ant-…'}" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="actions">
+          <button class="btn primary" data-act="keySave">Save key</button>
+          ${has ? '<button class="btn ghost" data-act="keyCancel">Cancel</button><button class="btn ghost right" data-act="keyRemove">Remove key</button>' : ''}
+        </div>
+        ${ui.err ? `<div class="err">${esc(ui.err)}</div>` : ''}
+        <p class="hint" style="margin-bottom:0">What you type in Ask Zuno, and your habit stats if you switch that on, is sent to Anthropic to answer you. Notes, habits and history otherwise stay on this device. The key is not included in exported backups.</p>
+      </section>`;
   }
 
   // ---- settings ----
@@ -873,6 +1292,14 @@
           <span class="t">Theme<small>Auto follows your device</small></span>
           ${segHtml('theme', theme, [['system', 'Auto'], ['light', 'Light'], ['dark', 'Dark']])}
         </div>
+        <div class="srow schemes-row">
+          <span class="t">Color scheme<small>Category icons, progress and charts. The streak fire is always orange.</small></span>
+        </div>
+        <div class="schemes">${SCHEMES.map(([id, name, sub]) => `
+          <button class="scheme ${s.scheme === id ? 'on' : ''}" data-act="scheme" data-v="${id}" data-scheme-preview="${id}" aria-pressed="${s.scheme === id}">
+            <span class="swatch">${['red', 'orange', 'green', 'blue', 'purple'].map(c => `<i style="background:var(--c-${c})"></i>`).join('')}</span>
+            <span class="nm">${name}<small>${sub}</small></span>
+          </button>`).join('')}</div>
       </div>
 
       <div class="section-h"><h3>Calendar</h3></div>
@@ -889,16 +1316,22 @@
         ${toggle('doneLast', 'Move finished habits down', 'Keeps what is left to do at the top')}
       </div>
 
+      <div class="section-h"><h3>Ask Zuno</h3><span class="frac">${aiKey() ? 'Key saved' : 'No key yet'}</span></div>
+      <div class="card list">
+        ${action('askKey', aiKey() ? 'Anthropic API key' : 'Set up Ask Zuno', aiKey() ? 'Saved on this device only. Replace or remove it' : 'Add your own Anthropic API key to use the AI')}
+        ${toggle('aiStats', 'Share habit stats', 'Send a summary of your habits and last 30 days with each question')}
+      </div>
+
       <div class="section-h"><h3>Data</h3><span class="frac">On this device</span></div>
       <div class="card list">
         ${action('export', 'Export backup', 'Save everything as a .json file')}
         ${action('import', 'Import backup', 'Replace current data with a .json file')}
         ${action('sample', 'Load sample data', 'Nine example habits with five weeks of history')}
-        ${action('erase', 'Erase everything', 'Remove all habits and history', 'danger')}
+        ${action('erase', 'Erase everything', 'Remove all habits, history, notes and the API key', 'danger')}
       </div>
       ${ui.note ? `<div class="err">${esc(ui.note)}</div>` : ''}
 
-      <div class="foot">Zuno ${VERSION} · ${state.habits.length} habits · ${days} days logged<br>Your data never leaves this device.</div>`;
+      <div class="foot">Zuno ${VERSION} · ${state.habits.length} habits · ${days} days logged · ${state.notes.length} notes<br>Your data stays on this device. Only what you send to Ask Zuno goes to Anthropic.</div>`;
   }
 
   // ---- about ----
@@ -967,7 +1400,7 @@
         <div class="section-h"><h3>Digital isn’t about more screen time</h3></div>
         <div class="prose">
           <p>The point is not to spend longer on your phone. Zuno should take ten seconds: open it, tick what you did, close it. The phone just happens to be the one thing you carry everywhere, and it’s good at exactly the part paper never was: doing the sums and remembering all of it.</p>
-          <p>Everything stays on your device. No account, no feed, nobody else looking at your numbers.</p>
+          <p>Everything stays on your device. No account, no feed, nobody else looking at your numbers. The one exception is Ask Zuno: what you type there goes to Anthropic, the company behind Claude, so it can answer.</p>
         </div>
 
         <div class="closer">
@@ -989,37 +1422,60 @@
     const pref = state.theme || 'light';
     const t = pref === 'system' ? (mq.matches ? 'dark' : 'light') : pref;
     document.documentElement.dataset.theme = t;
+    document.documentElement.dataset.scheme = state.settings.scheme || 'classic';
     meta.setAttribute('content', t === 'dark' ? '#000000' : '#ffffff');
   }
 
-  // The rail is built once; renders only flip classes so the open/close transitions can run.
+  const TABS = [
+    { id: 'today', label: 'Progress', icon: '<circle cx="12" cy="12" r="8" opacity=".35"/><path d="M12 4a8 8 0 1 1-8 8"/>' },
+    { id: 'stats', label: 'Stats', icon: '<path d="M5 20v-8M12 20V5M19 20v-5"/>' },
+    { id: 'habits', label: 'Habits', icon: '<path d="M4 7.5l2 2 3.5-3.5M4 16.5l2 2 3.5-3.5M13 8h7M13 17h7"/>' },
+    { id: 'notebook', label: 'Notebook', icon: '<rect x="5" y="3.5" width="14" height="17" rx="2.5"/><path d="M9 8.5h6M9 12h6M9 15.5h3.5"/>' },
+    { id: 'settings', label: 'Settings', icon: '<path d="M4 7h9M18 7h2M4 17h3M11 17h9"/><circle cx="15.5" cy="7" r="2.2"/><circle cx="9" cy="17" r="2.2"/>' },
+  ];
+  const $subnav = document.getElementById('subnav');
+  let subnavFor = null;
+
+  // The tab bar is built once; renders only flip classes so its transitions can run.
   function buildNav() {
-    $nav.innerHTML = NAV.map(s => {
-      const head = `<button class="${s.subs ? 'has-sub' : ''}" data-view="${s.id}"
-        ${s.subs ? `aria-expanded="false" aria-controls="sub-${s.id}"` : ''}>${s.label}</button>`;
-      if (!s.subs) return head;
-      return head + `<div class="sub" id="sub-${s.id}" inert><div>${s.subs.map(([id, full, short], i) =>
-        `<button style="--i:${i}" data-view="${s.id}" data-sub="${id}" aria-label="${full}">
-          <span class="full">${full}</span><span class="short">${short}</span></button>`).join('')}</div></div>`;
-    }).join('');
+    $nav.innerHTML = `<div>${TABS.map(t => `
+      <button class="tab" data-view="${t.id}" aria-label="${t.label}">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true">${t.icon}</svg></span>${t.label}
+      </button>`).join('')}</div>`;
   }
 
   function renderNav() {
-    $nav.querySelectorAll(':scope > button').forEach(b => {
+    $nav.querySelectorAll('.tab').forEach(b => {
       const on = b.dataset.view === ui.view;
       b.classList.toggle('on', on);
-      if (b.hasAttribute('aria-expanded')) b.setAttribute('aria-expanded', on);
+      if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
     });
-    $nav.querySelectorAll('.sub').forEach(el => {
-      const v = el.id.slice(4);
-      const isOpen = v === ui.view;
-      el.classList.toggle('open', isOpen);
-      el.inert = !isOpen;
-      el.querySelectorAll('button').forEach(b => b.classList.toggle('on', isOpen && ui.sub[v] === b.dataset.sub));
-    });
-    document.querySelector('[data-view="settings"]').classList.toggle('on', ui.view === 'settings');
     document.querySelector('.brand').classList.toggle('on', ui.view === 'about');
+
+    // Pills for the current section's pages. Rebuilt (and animated in) only when the section changes.
+    const sec = NAV.find(s => s.id === ui.view && s.subs);
+    if (subnavFor !== ui.view) {
+      subnavFor = ui.view;
+      $subnav.innerHTML = sec ? `<div>${sec.subs.map(([id, full, short], i) =>
+        `<button style="--i:${i}" data-view="${sec.id}" data-sub="${id}">
+          <span class="full">${full}</span><span class="short">${short}</span></button>`).join('')}</div>` : '';
+      $subnav.classList.toggle('open', !!sec);
+      if (sec) {
+        $subnav.classList.add('fresh');
+        void $subnav.offsetWidth; // let the hidden state paint before animating in
+        $subnav.classList.remove('fresh');
+      }
+    }
+    $subnav.querySelectorAll('button').forEach(b => {
+      const on = sec && ui.sub[sec.id] === b.dataset.sub;
+      b.classList.toggle('on', !!on);
+      if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+    });
   }
+
+  // Hairline under the top bar once the page scrolls under it.
+  const $top = document.querySelector('.top');
+  window.addEventListener('scroll', () => $top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
 
   const VIEWS = {
     today: { day: viewDay, week: () => viewReport('week'), month: () => viewReport('month') },
@@ -1027,19 +1483,28 @@
     about: viewAbout,
     stats: { overview: viewOverview, byhabit: viewByHabit, bycat: viewByCat, trajectory: viewTrajectory },
     habits: { add: viewAdd, change: viewChange, list: viewList },
+    notebook: { notes: viewNotes, ask: viewAsk },
   };
   function render() {
     renderNav();
     const v = VIEWS[ui.view];
     $view.innerHTML = typeof v === 'function' ? v() : v[ui.sub[ui.view]]();
+    $view.querySelectorAll('textarea').forEach(autosize);
     ui.pop = null;
+  }
+
+  function autosize(el) {
+    el.style.height = 'auto';
+    el.style.height = el.scrollHeight + 2 + 'px';
   }
 
   function go(view, sub) {
     if (sub) ui.sub[view] = sub;
     const changed = ui.view !== view || sub;
+    if (changed && ui.noteId) leaveNote();
     ui.view = view;
     ui.note = '';
+    ui.keyEdit = false;
     if (changed) resetForm();
     render();
     window.scrollTo(0, 0);
@@ -1250,6 +1715,9 @@
         state.theme = b.dataset.v;
         save(); applyTheme();
         break;
+      case 'scheme':
+        state.settings.scheme = b.dataset.v; save(); applyTheme();
+        break;
       case 'weekStart':
         state.settings.weekStart = b.dataset.v; save();
         break;
@@ -1268,11 +1736,100 @@
       case 'import': $file.value = ''; $file.click(); return;
       case 'sample':
         if (state.habits.length && !confirm('Replace your current habits and history with sample data?')) return;
-        replaceState(normalize({ ...seed(), theme: state.theme, settings: state.settings }));
+        replaceState(normalize({ ...seed(), theme: state.theme, settings: state.settings, notes: state.notes, chat: state.chat }));
         ui.note = 'Sample data loaded';
         break;
+      // notebook
+      case 'newNote': {
+        const n = newNote();
+        ui.noteId = n.id; ui.noteEdit = true;
+        render();
+        document.getElementById('n-title').focus();
+        return;
+      }
+      case 'openNote':
+        if (ui.view !== 'notebook' || ui.sub.notebook !== 'notes') go('notebook', 'notes');
+        ui.noteId = id; ui.noteEdit = false;
+        window.scrollTo(0, 0);
+        break;
+      case 'closeNote': leaveNote(); break;
+      case 'noteEdit': ui.noteEdit = true; break;
+      case 'noteDone': {
+        const n = findNote(ui.noteId);
+        if (n && !n.title.trim() && !n.body.trim()) leaveNote(); else ui.noteEdit = false;
+        save();
+        break;
+      }
+      case 'delNote':
+        if (!confirm('Delete this note?')) return;
+        state.notes = state.notes.filter(n => n.id !== ui.noteId);
+        ui.noteId = null; ui.noteEdit = false;
+        save();
+        break;
+      case 'suggToggle': {
+        const sel = ui.sel[b.dataset.k];
+        if (sel) sel[Number(b.dataset.i)] = !sel[Number(b.dataset.i)];
+        break;
+      }
+      case 'suggAdd': {
+        const k = b.dataset.k;
+        const owner = k.startsWith('chat-') ? state.chat.items[Number(k.slice(5))] : findNote(k.slice(5));
+        if (!owner || !owner.habits) break;
+        const n = addSuggested(k, owner.habits);
+        if (n) owner.added = true;
+        save();
+        break;
+      }
+      case 'saveReply': {
+        const it = state.chat.items[Number(b.dataset.i)];
+        if (!it) break;
+        const heading = (it.text.match(/^#{1,4}\s+(.+)$/m) || [])[1];
+        const n = newNote({ title: plain(heading || it.text.split('\n')[0]).slice(0, 60), body: it.text, source: 'ai',
+          habits: it.habits && it.habits.length ? it.habits : null, added: !!it.added });
+        it.noteId = n.id;
+        save();
+        break;
+      }
+
+      // ask zuno
+      case 'starter': {
+        const [, text] = STARTERS[Number(b.dataset.i)];
+        ui.draft = text;
+        if (Number(b.dataset.i) === 3) { state.settings.aiStats = true; save(); }
+        render();
+        const input = document.getElementById('ai-input');
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+        return;
+      }
+      case 'aiSend': askZuno(document.getElementById('ai-input').value); return;
+      case 'aiStop': if (ui.ai.stream) ui.ai.stream.abort(); return;
+      case 'aiStats': state.settings.aiStats = !state.settings.aiStats; save(); break;
+      case 'aiNew':
+        if (ui.ai.busy) return;
+        state.chat.items = []; ui.sel = {}; ui.ai.err = ''; ui.draft = '';
+        save();
+        break;
+      case 'askKey': go('notebook', 'ask'); ui.keyEdit = true; break;
+      case 'keyEdit': ui.keyEdit = true; ui.err = ''; break;
+      case 'keyCancel': ui.keyEdit = false; ui.err = ''; break;
+      case 'keySave': {
+        const v = document.getElementById('ai-key').value.trim();
+        if (!v) { ui.err = 'Paste your key first.'; break; }
+        if (!v.startsWith('sk-')) { ui.err = 'That doesn’t look like an Anthropic API key. They start with “sk-ant-”.'; break; }
+        try { localStorage.setItem(AI_KEY, v); } catch (err) { ui.err = 'Couldn’t save the key on this device.'; break; }
+        ui.keyEdit = false; ui.err = '';
+        break;
+      }
+      case 'keyRemove':
+        if (!confirm('Remove your API key from this device?')) return;
+        try { localStorage.removeItem(AI_KEY); } catch (err) { /* nothing stored */ }
+        ui.keyEdit = false;
+        break;
+
       case 'erase':
-        if (!confirm('Erase all habits and history on this device?')) return;
+        if (!confirm('Erase all habits, history, notes and the API key on this device?')) return;
+        try { localStorage.removeItem(AI_KEY); } catch (err) { /* nothing stored */ }
         replaceState(blank());
         ui.note = 'Everything erased';
         break;
@@ -1368,7 +1925,18 @@
   document.addEventListener('input', e => {
     if (e.target.id === 'f-name') { ui.form.name = e.target.value; ui.err = ''; }
     if (e.target.id === 'f-newcat') { ui.form.newCat = e.target.value; ui.err = ''; }
+    if (e.target.id === 'n-title' || e.target.id === 'n-body') {
+      const n = findNote(ui.noteId);
+      if (!n) return;
+      n[e.target.id === 'n-title' ? 'title' : 'body'] = e.target.value;
+      n.updated = new Date().toISOString();
+      clearTimeout(noteTimer);
+      noteTimer = setTimeout(save, 400);
+    }
+    if (e.target.id === 'ai-input') ui.draft = e.target.value;
+    if (e.target.tagName === 'TEXTAREA') autosize(e.target);
   });
+  let noteTimer = null;
   document.addEventListener('change', e => {
     if (e.target.id === 'f-cat') {
       ui.form.cat = e.target.value;
@@ -1392,6 +1960,8 @@
       return;
     }
     if (e.key !== 'Enter') return;
+    if (e.target.id === 'ai-input' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); askZuno(e.target.value); return; }
+    if (e.target.id === 'n-title') { e.preventDefault(); document.getElementById('n-body').focus(); return; }
     if (e.target.id === 'f-name' || e.target.id === 'f-newcat') { saveHabit(); render(); }
     if (e.target.id === 'c-name') document.querySelector('[data-act="addCat"]').click();
   });

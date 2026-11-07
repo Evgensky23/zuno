@@ -20,6 +20,9 @@
     if (!t) t = 'light';
     if (t === 'system') t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     document.documentElement.dataset.theme = t;
+    var sc = 'classic';
+    try { sc = ((JSON.parse(localStorage.getItem('zuno.v1')) || {}).settings || {}).scheme || 'classic'; } catch (e) {}
+    document.documentElement.dataset.scheme = sc;
   })();
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -28,21 +31,29 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <linearGradient id="zuno-flame" x1="0" y1="1" x2="0" y2="0">
+        <stop offset="0" stop-color="#FF3B30"/>
+        <stop offset="1" stop-color="#FF9F0A"/>
+      </linearGradient>
+    </defs>
+  </svg>
   <div class="shell">
-    <aside class="rail">
-      <button class="brand" data-view="about" aria-label="About Zuno">
-        <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
-          <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-opacity=".25" stroke-width="3"/>
-          <path d="M12 3a9 9 0 1 1-9 9" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-        </svg><span>Zuno</span>
-      </button>
-      <nav class="nav" id="nav"></nav>
-      <nav class="nav nav-end">
-        <button data-view="settings">Settings</button>
-      </nav>
-    </aside>
+    <header class="top">
+      <div class="top-row">
+        <button class="brand" data-view="about" aria-label="About Zuno">
+          <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-opacity=".25" stroke-width="3"/>
+            <path d="M12 3a9 9 0 1 1-9 9" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+          </svg><span>Zuno</span>
+        </button>
+      </div>
+      <nav class="subnav" id="subnav" aria-label="Pages in this section"></nav>
+    </header>
     <main id="view"></main>
   </div>
+  <nav class="tabbar" id="nav" aria-label="Main"></nav>
   <input type="file" id="import-file" accept="application/json,.json" hidden>
   <script src="app.js"></script>
   <script>
