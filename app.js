@@ -3,7 +3,7 @@
 
   const KEY = 'zuno.v1';
   const OLD_KEY = 'tally.v1'; // data saved before the rename
-  const VERSION = '0.9';
+  const VERSION = '0.9.1';
   const DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const DOW_LONG = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   const DOW1 = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];

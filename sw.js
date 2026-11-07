@@ -1,5 +1,5 @@
 // Keeps Zuno working offline. Bump VERSION whenever app files change so phones pick up the new build.
-const VERSION = 'zuno-0.9';
+const VERSION = 'zuno-0.9.1';
 const SHELL = [
   './',
   './index.html',
@@ -43,8 +43,10 @@ self.addEventListener('fetch', e => {
   }
 
   if (url.origin !== location.origin) return;
+  // cache: 'no-cache' asks the server every time, so a new upload shows up on the next open
+  // instead of waiting for the browser's own copy to expire.
   e.respondWith(
-    fetch(req).then(res => {
+    fetch(req, { cache: 'no-cache' }).then(res => {
       const copy = res.clone();
       caches.open(VERSION).then(c => c.put(req, copy));
       return res;
