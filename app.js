@@ -3,16 +3,16 @@
 
   const KEY = 'zuno.v1';
   const OLD_KEY = 'tally.v1'; // data saved before the rename
-  const VERSION = '0.7';
+  const VERSION = '0.9';
   const DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const DOW_LONG = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   const DOW1 = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
   const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
     'August', 'September', 'October', 'November', 'December'];
   const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
-  const DEFAULT_SETTINGS = { weekStart: 'mon', streaks: true, doneLast: false, aiStats: false };
+  const DEFAULT_SETTINGS = { weekStart: 'mon', streaks: true, doneLast: false, aiStats: false, scheme: 'classic' };
 
-  // Left rail: sections and their sub-sections ([id, full label, short label for the narrow rail]).
+  // Sections and their pages ([id, full label, short label for narrow screens]), shown as pills under the top bar.
   const NAV = [
     { id: 'today', label: 'Progress', subs: [
       ['day', 'Today', 'Today'],
@@ -191,45 +191,79 @@
     return { done: hs.filter(h => isDone(h, d)).length, total: hs.length };
   }
 
-  // Streaks: days in a row for day habits, weeks in a row for weekly ones.
-  // Skipped, rest and paused days neither add to a streak nor break it.
-  function streaks(h) {
-    const t = today();
-    if (h.mode === 'weekly') {
-      const status = [];
-      const cur = weekStartOf(t);
-      for (let w = weekStartOf(h.created); w <= cur; w = addDays(w, 7)) {
-        let cnt = 0, avail = 0;
-        for (let i = 0; i < 7; i++) {
-          const x = addDays(w, i);
-          if (x < h.created || !listed(h, x)) continue;
-          if (isDone(h, x)) cnt++;
-          if (x > t || open(h, x)) avail++;
-        }
-        const target = Math.min(h.times, Math.max(avail, cnt));
-        status.push(!target ? 'skip' : cnt >= target ? 'met' : w === cur ? 'skip' : 'fail');
-      }
-      let now = 0, best = 0, run = 0;
-      for (const s of status) { if (s === 'met') best = Math.max(best, ++run); else if (s === 'fail') run = 0; }
-      for (let i = status.length - 1; i >= 0; i--) { if (status[i] === 'met') now++; else if (status[i] === 'fail') break; }
-      return { now, best, unit: 'w' };
+  // ---- streaks (the fire) ----
+  // A missed day only breaks a streak once it is fully over: at 3 am the next morning.
+  // So today is always still open, and so is yesterday until 3 am.
+  const openFrom = () => (new Date().getHours() < 3 ? addDays(today(), -1) : today());
+  const neutralDay = (h, d) => isPaused(h, d) || isRest(d) || isSkipped(h, d);
+
+  // How many times in a row this habit was done.
+  // Set days: days it isn't set for don't matter; a missed set day ends the streak.
+  // X times a week: up to 8 - X missed days in a row are allowed; one more ends it.
+  // Skipped, rest and paused days never count as missed.
+  function habitStreak(h) {
+    const from = openFrom();
+    const gap = h.mode === 'weekly' ? 8 - h.times : 0;
+    let count = 0, missed = 0;
+    for (let d = today(), i = 0; d >= h.created && i < 3660; d = addDays(d, -1), i++) {
+      if (h.mode !== 'weekly' && !h.days.includes(dow(d))) continue;
+      if (isDone(h, d)) { count++; missed = 0; continue; }
+      if (neutralDay(h, d) || d >= from) continue;
+      if (++missed > gap) break;
     }
-    let d = t;
-    if (!isDone(h, d)) d = addDays(d, -1); // today isn't over yet
-    let now = 0;
-    for (let i = 0; i < 3660 && d >= h.created; i++, d = addDays(d, -1)) {
-      if (!due(h, d)) continue;
-      if (isDone(h, d)) now++; else break;
-    }
-    let best = 0, run = 0;
-    for (let x = h.created; x <= t; x = addDays(x, 1)) {
-      if (!due(h, x)) continue;
-      if (isDone(h, x)) best = Math.max(best, ++run);
-      else if (x !== t) run = 0;
-    }
-    return { now, best, unit: 'd' };
+    return count;
   }
-  const streakText = s => (s.unit === 'w' ? `${s.now} ${s.now === 1 ? 'week' : 'weeks'} in a row` : `${s.now} in a row`);
+
+  // Days in a row with at least half of the day's due habits done.
+  // Rest days and days with nothing planned count too; the streak starts with the first habit.
+  function dayStreak() {
+    if (!state.habits.length) return 0;
+    const first = state.habits.reduce((m, h) => (h.created < m ? h.created : m), today());
+    const from = openFrom();
+    let count = 0;
+    for (let d = today(); d >= first; d = addDays(d, -1)) {
+      const s = dayScore(d);
+      if (isRest(d) || !s.total || s.done * 2 >= s.total) { count++; continue; }
+      if (d >= from) continue;
+      break;
+    }
+    return count;
+  }
+
+  const FLAME = '<path d="M12 2.5c.7 3.1 3.3 4.8 4.6 7.4 1.8 3.7-.2 9-4.6 9.6-4.5.5-7.3-3-6.4-6.9.4-1.8 1.5-3.1 2.7-4 .1 1.6.7 2.8 1.9 3.4-.6-3.4.5-6.8 1.8-9.5z" fill="url(#zuno-flame)"/>';
+  const fire = (n, title) => `<span class="fire ${n ? '' : 'off'}" title="${title}"><svg viewBox="0 0 24 24" aria-hidden="true">${FLAME}</svg>${n}</span>`;
+  const habitFire = h => { const n = habitStreak(h); return fire(n, `${n} in a row`); };
+
+  // ---- category icons and colors ----
+  const CAT_STYLE = {
+    sport: ['red', '<path d="M6.5 8v8M17.5 8v8M3.5 10v4M20.5 10v4M6.5 12h11"/>'],
+    health: ['pink', '<path d="M12 19s-7-4.3-7-9.1A3.9 3.9 0 0 1 12 7.6a3.9 3.9 0 0 1 7 2.3C19 14.7 12 19 12 19z"/>'],
+    diet: ['green', '<path d="M12 8.2c-3-1.6-6.6.4-6.6 4.4S8 20 10 20c1 0 1.3-.5 2-.5s1 .5 2 .5c2 0 4.6-3.4 4.6-7.4S15 6.6 12 8.2z"/><path d="M12 8.2c0-2.1 1-3.6 3-4.2"/>'],
+    education: ['blue', '<path d="M12 7c-2-1.4-5-1.9-8-1.4v12.5c3-.5 6 0 8 1.4 2-1.4 5-1.9 8-1.4V5.6C17 5.1 14 5.6 12 7zM12 7v12.5"/>'],
+    religion: ['indigo', '<path d="M12 3.5l1.9 5.6 5.6 1.9-5.6 1.9L12 18.5l-1.9-5.6L4.5 11l5.6-1.9z"/>'],
+    mind: ['teal', '<circle cx="12" cy="12" r="7"/><path d="M8.8 12.6c1.1 1.1 2.1 1.1 3.2 0s2.1-1.1 3.2 0"/>'],
+    sleep: ['purple', '<path d="M18.5 14.6A7 7 0 0 1 9.4 5.5a7 7 0 1 0 9.1 9.1z"/>'],
+    work: ['gray', '<rect x="4" y="8" width="16" height="11" rx="2"/><path d="M9 8V6.5A1.5 1.5 0 0 1 10.5 5h3A1.5 1.5 0 0 1 15 6.5V8M4 13h16"/>'],
+    social: ['orange', '<circle cx="9" cy="9" r="3"/><path d="M4 19c0-3 2.2-5 5-5s5 2 5 5"/><circle cx="17" cy="10" r="2.3"/><path d="M15.6 14.3c2.6-.4 4.4 1.4 4.4 4.2"/>'],
+    finance: ['yellow', '<circle cx="12" cy="12" r="7.5"/><path d="M14.5 9.6c-.5-.8-1.4-1.2-2.5-1.2-1.5 0-2.5.8-2.5 1.9 0 2.6 5 1.3 5 3.9 0 1.1-1 1.9-2.5 1.9-1.2 0-2.1-.5-2.6-1.3M12 7v1.4M12 15.6V17"/>'],
+  };
+  const COLOR_ORDER = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'indigo', 'purple', 'pink', 'gray'];
+  // Categories you add yourself get a color picked from their name, so it never changes.
+  function catStyle(id) {
+    if (CAT_STYLE[id]) return CAT_STYLE[id];
+    let h = 0;
+    for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    return [COLOR_ORDER[h % COLOR_ORDER.length], '<circle cx="12" cy="12" r="3.2"/><circle cx="12" cy="12" r="7.5"/>'];
+  }
+  const catColor = id => `var(--c-${catStyle(id)[0]})`;
+  const catIcon = id => `<span class="cat-ic" style="--cc:${catColor(id)}"><svg viewBox="0 0 24 24" aria-hidden="true">${catStyle(id)[1]}</svg></span>`;
+
+  const SCHEMES = [
+    ['classic', 'Classic', 'Black and white'],
+    ['vivid', 'Vivid', 'Bright colors, like iOS'],
+    ['soft', 'Soft', 'Muted pastels'],
+    ['earth', 'Earth', 'Greens and warm tones'],
+  ];
 
   function habitPeriod(h, from, to) {
     let done = 0, total = 0;
@@ -297,7 +331,8 @@
         <div class="daynav">
           <div class="date">
             <span class="k">${label}</span>
-            <span class="v">${dd.getDate()} ${MONTHS[dd.getMonth()]} ${dd.getFullYear() !== new Date().getFullYear() ? dd.getFullYear() : ''}</span>
+            <span class="v">${dd.getDate()} ${MONTHS[dd.getMonth()]} ${dd.getFullYear() !== new Date().getFullYear() ? dd.getFullYear() : ''}
+              ${state.habits.length ? fire(dayStreak(), 'Days in a row with at least half of your habits done') : ''}</span>
           </div>
           <div class="arrows">
             <button class="arrow" data-act="shift" data-n="-1" aria-label="Previous day">←</button>
@@ -344,7 +379,7 @@
       let meta = '';
       if (skipped) meta = 'Skipped';
       else if (weekly) meta = met ? 'Done for the week' : `${wk}/${h.times} this week`;
-      else if (showStreaks) { const s = streaks(h); if (s.now > 1) meta = streakText(s); }
+      if (showStreaks && !skipped) { const n = habitStreak(h); if (n) meta += (meta ? ' ' : '') + fire(n, `${n} in a row`); }
       return `<div class="habit ${done ? 'done' : ''} ${skipped ? 'skipped' : ''} ${met ? 'met' : ''} ${ui.pop === h.id ? 'pop' : ''}">
         <button class="hmain" data-act="toggle" data-id="${h.id}" aria-pressed="${done}">
           <span class="box"></span>
@@ -362,7 +397,7 @@
       const due_ = list.filter(h => due(h, d)).length;
       if (state.settings.doneLast) list = [...list.filter(h => !isDone(h, d)), ...list.filter(h => isDone(h, d))];
       return `<section class="group">
-        <header><h3>${esc(c.name)}</h3><span class="frac">${k}/${due_}</span></header>
+        <header><h3>${catIcon(c.id)}${esc(c.name)}</h3><span class="frac">${k}/${due_}</span></header>
         ${list.map(row).join('')}
       </section>`;
     }).join('');
@@ -494,8 +529,8 @@
     const dl = (now, before) => (before == null ? '' : now === before ? '±0' : `${now > before ? '+' : '−'}${Math.abs(now - before)}`);
     const cats = cur.perCat.sort((a, b2) => b2.done / b2.total - a.done / a.total).map(x => `
       <div class="brow">
-        <span>${esc(x.c.name)}</span>
-        <span class="bar"><b style="width:${pct(x.done, x.total)}%"></b></span>
+        <span class="cn">${catIcon(x.c.id)}${esc(x.c.name)}</span>
+        <span class="bar" style="--cc:${catColor(x.c.id)}"><b style="width:${pct(x.done, x.total)}%"></b></span>
         <span class="num">${dl(pct(x.done, x.total), prevCat.get(x.c.id))}</span>
         <span class="num strong">${pct(x.done, x.total)}%</span>
       </div>`).join('');
@@ -572,20 +607,18 @@
 
   function viewByHabit() {
     const R = ui.range;
-    const rows = state.habits.map(h => ({ h, ...habitRange(h, R), s: streaks(h) }))
+    const rows = state.habits.map(h => ({ h, ...habitRange(h, R) }))
       .filter(x => x.total || !x.h.archived)
       .sort((a, b) => pct(b.done, b.total) - pct(a.done, a.total));
-    const u = s => (s.unit === 'w' ? 'w' : '');
     const body = `
-      <div class="card list" style="margin-top:16px"><div class="trow head"><span></span><span class="th">Rate</span><span class="th">Now</span><span class="th">Best</span></div>
+      <div class="card list" style="margin-top:16px"><div class="trow head"><span></span><span class="th">Rate</span><span class="th">Streak</span></div>
       ${rows.map(x => `<div class="trow">
         <span class="nm">${esc(x.h.name)}<small>${esc(catName(x.h.cat))} · ${x.done}/${x.total}${statusLabel(x.h) ? ' · ' + statusLabel(x.h) : ''}</small>
           <span class="mbar"><b style="width:${pct(x.done, x.total)}%"></b></span></span>
         <span class="num strong">${x.total ? pct(x.done, x.total) + '%' : '—'}</span>
-        <span class="num">${x.s.now}${u(x.s)}</span>
-        <span class="num">${x.s.best}${u(x.s)}</span>
+        <span class="num">${habitFire(x.h)}</span>
       </div>`).join('')}
-      </div><div class="foot">Now = current streak · Best = longest streak ever · w = weeks, for weekly habits</div>`;
+      </div><div class="foot">Streak = times done in a row. A missed day ends it at 3 am the next morning; days a habit isn’t set for, and skipped, rest or paused days, don’t count as missed. “X times a week” habits can miss up to 8 − X days in a row.</div>`;
     return pageHead('Stats', 'By habit') + (state.habits.length ? rangeBar() + body : noHabits());
   }
 
@@ -599,8 +632,8 @@
 
     const body = `<div class="card list" style="margin-top:16px">${cats.map(x => `
       <div class="brow">
-        <span>${esc(x.c.name)}</span>
-        <span class="bar"><b style="width:${pct(x.done, x.total)}%"></b></span>
+        <span class="cn">${catIcon(x.c.id)}${esc(x.c.name)}</span>
+        <span class="bar" style="--cc:${catColor(x.c.id)}"><b style="width:${pct(x.done, x.total)}%"></b></span>
         <span class="num">${x.done}/${x.total}</span>
         <span class="num strong">${pct(x.done, x.total)}%</span>
       </div>
@@ -787,7 +820,7 @@
       const hs = live.filter(h => h.cat === c.id);
       if (!hs.length) return '';
       return `<section class="group">
-        <header><h3>${esc(c.name)}</h3><span class="frac">${hs.length}</span></header>
+        <header><h3>${catIcon(c.id)}${esc(c.name)}</h3><span class="frac">${hs.length}</span></header>
         <div class="sortlist" data-sort-kind="habits">${hs.map(h => itemRow(h, true)).join('')}</div>
       </section>`;
     }).join('');
@@ -804,7 +837,7 @@
         const k = counts(c.id);
         return `<div class="item" data-sort data-id="${c.id}">
           <button class="handle" data-id="${c.id}" aria-label="Move ${esc(c.name)}. Use arrow keys or drag." title="Drag to reorder"></button>
-          <span class="iname static">${esc(c.name)}</span>
+          <span class="iname static">${catIcon(c.id)}${esc(c.name)}</span>
           ${k ? `<span class="sched">${k}</span>` : `<button class="x" data-act="delCat" data-id="${c.id}" aria-label="Remove ${esc(c.name)}">×</button>`}
         </div>`;
       }).join('')}</div>
@@ -836,12 +869,11 @@
         const d = addDays(t, -i);
         strip += `<i class="${isDone(h, d) ? 'on' : due(h, d) ? '' : 'na'}"></i>`;
       }
-      const s = streaks(h);
       const status = statusLabel(h);
       return `<button class="hrow" data-act="editFrom" data-id="${h.id}">
         <span class="nm">${esc(h.name)}<small>${schedLabel(h)} · since ${shortDate(h.created)}${status ? ' · ' + status : ''}</small></span>
         <span class="rt"><span class="strip" title="Last 14 days">${strip}</span>
-          <span class="streak">${s.now ? streakText(s) : 'No streak'}</span></span>
+          <span class="streak">${habitFire(h)}</span></span>
       </button>`;
     };
 
@@ -849,7 +881,7 @@
       const hs = live.filter(h => h.cat === c.id);
       if (!hs.length) return '';
       return `<section class="group">
-        <header><h3>${esc(c.name)}</h3><span class="frac">${hs.length}</span></header>
+        <header><h3>${catIcon(c.id)}${esc(c.name)}</h3><span class="frac">${hs.length}</span></header>
         ${hs.map(row).join('')}
       </section>`;
     }).join('');
@@ -1067,8 +1099,7 @@ Today is ${DOW_LONG[dow(today())]}, ${t.getDate()} ${MONTHS[t.getMonth()]} ${t.g
     const live = state.habits.filter(h => !h.archived);
     const lines = live.map(h => {
       const r = habitRange(h, 30);
-      const s = streaks(h);
-      return `- ${h.name} · ${catName(h.cat)} · ${schedLabel(h)} · last 30 days ${r.done}/${r.total}${r.total ? ` (${pct(r.done, r.total)}%)` : ''} · streak ${s.now} ${s.unit === 'w' ? 'weeks' : 'days'}${isPaused(h, t) ? ' · paused' : ''}`;
+      return `- ${h.name} · ${catName(h.cat)} · ${schedLabel(h)} · last 30 days ${r.done}/${r.total}${r.total ? ` (${pct(r.done, r.total)}%)` : ''} · done ${habitStreak(h)} times in a row${isPaused(h, t) ? ' · paused' : ''}`;
     });
     let done = 0, total = 0;
     for (let i = 0; i < 30; i++) { const s = dayScore(addDays(t, -i)); done += s.done; total += s.total; }
@@ -1261,6 +1292,14 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
           <span class="t">Theme<small>Auto follows your device</small></span>
           ${segHtml('theme', theme, [['system', 'Auto'], ['light', 'Light'], ['dark', 'Dark']])}
         </div>
+        <div class="srow schemes-row">
+          <span class="t">Color scheme<small>Category icons, progress and charts. The streak fire is always orange.</small></span>
+        </div>
+        <div class="schemes">${SCHEMES.map(([id, name, sub]) => `
+          <button class="scheme ${s.scheme === id ? 'on' : ''}" data-act="scheme" data-v="${id}" data-scheme-preview="${id}" aria-pressed="${s.scheme === id}">
+            <span class="swatch">${['red', 'orange', 'green', 'blue', 'purple'].map(c => `<i style="background:var(--c-${c})"></i>`).join('')}</span>
+            <span class="nm">${name}<small>${sub}</small></span>
+          </button>`).join('')}</div>
       </div>
 
       <div class="section-h"><h3>Calendar</h3></div>
@@ -1383,37 +1422,60 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
     const pref = state.theme || 'light';
     const t = pref === 'system' ? (mq.matches ? 'dark' : 'light') : pref;
     document.documentElement.dataset.theme = t;
+    document.documentElement.dataset.scheme = state.settings.scheme || 'classic';
     meta.setAttribute('content', t === 'dark' ? '#000000' : '#ffffff');
   }
 
-  // The rail is built once; renders only flip classes so the open/close transitions can run.
+  const TABS = [
+    { id: 'today', label: 'Progress', icon: '<circle cx="12" cy="12" r="8" opacity=".35"/><path d="M12 4a8 8 0 1 1-8 8"/>' },
+    { id: 'stats', label: 'Stats', icon: '<path d="M5 20v-8M12 20V5M19 20v-5"/>' },
+    { id: 'habits', label: 'Habits', icon: '<path d="M4 7.5l2 2 3.5-3.5M4 16.5l2 2 3.5-3.5M13 8h7M13 17h7"/>' },
+    { id: 'notebook', label: 'Notebook', icon: '<rect x="5" y="3.5" width="14" height="17" rx="2.5"/><path d="M9 8.5h6M9 12h6M9 15.5h3.5"/>' },
+    { id: 'settings', label: 'Settings', icon: '<path d="M4 7h9M18 7h2M4 17h3M11 17h9"/><circle cx="15.5" cy="7" r="2.2"/><circle cx="9" cy="17" r="2.2"/>' },
+  ];
+  const $subnav = document.getElementById('subnav');
+  let subnavFor = null;
+
+  // The tab bar is built once; renders only flip classes so its transitions can run.
   function buildNav() {
-    $nav.innerHTML = NAV.map(s => {
-      const head = `<button class="${s.subs ? 'has-sub' : ''}" data-view="${s.id}"
-        ${s.subs ? `aria-expanded="false" aria-controls="sub-${s.id}"` : ''}>${s.label}</button>`;
-      if (!s.subs) return head;
-      return head + `<div class="sub" id="sub-${s.id}" inert><div>${s.subs.map(([id, full, short], i) =>
-        `<button style="--i:${i}" data-view="${s.id}" data-sub="${id}" aria-label="${full}">
-          <span class="full">${full}</span><span class="short">${short}</span></button>`).join('')}</div></div>`;
-    }).join('');
+    $nav.innerHTML = `<div>${TABS.map(t => `
+      <button class="tab" data-view="${t.id}" aria-label="${t.label}">
+        <span class="ic"><svg viewBox="0 0 24 24" aria-hidden="true">${t.icon}</svg></span>${t.label}
+      </button>`).join('')}</div>`;
   }
 
   function renderNav() {
-    $nav.querySelectorAll(':scope > button').forEach(b => {
+    $nav.querySelectorAll('.tab').forEach(b => {
       const on = b.dataset.view === ui.view;
       b.classList.toggle('on', on);
-      if (b.hasAttribute('aria-expanded')) b.setAttribute('aria-expanded', on);
+      if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
     });
-    $nav.querySelectorAll('.sub').forEach(el => {
-      const v = el.id.slice(4);
-      const isOpen = v === ui.view;
-      el.classList.toggle('open', isOpen);
-      el.inert = !isOpen;
-      el.querySelectorAll('button').forEach(b => b.classList.toggle('on', isOpen && ui.sub[v] === b.dataset.sub));
-    });
-    document.querySelector('[data-view="settings"]').classList.toggle('on', ui.view === 'settings');
     document.querySelector('.brand').classList.toggle('on', ui.view === 'about');
+
+    // Pills for the current section's pages. Rebuilt (and animated in) only when the section changes.
+    const sec = NAV.find(s => s.id === ui.view && s.subs);
+    if (subnavFor !== ui.view) {
+      subnavFor = ui.view;
+      $subnav.innerHTML = sec ? `<div>${sec.subs.map(([id, full, short], i) =>
+        `<button style="--i:${i}" data-view="${sec.id}" data-sub="${id}">
+          <span class="full">${full}</span><span class="short">${short}</span></button>`).join('')}</div>` : '';
+      $subnav.classList.toggle('open', !!sec);
+      if (sec) {
+        $subnav.classList.add('fresh');
+        void $subnav.offsetWidth; // let the hidden state paint before animating in
+        $subnav.classList.remove('fresh');
+      }
+    }
+    $subnav.querySelectorAll('button').forEach(b => {
+      const on = sec && ui.sub[sec.id] === b.dataset.sub;
+      b.classList.toggle('on', !!on);
+      if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+    });
   }
+
+  // Hairline under the top bar once the page scrolls under it.
+  const $top = document.querySelector('.top');
+  window.addEventListener('scroll', () => $top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
 
   const VIEWS = {
     today: { day: viewDay, week: () => viewReport('week'), month: () => viewReport('month') },
@@ -1652,6 +1714,9 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       case 'theme':
         state.theme = b.dataset.v;
         save(); applyTheme();
+        break;
+      case 'scheme':
+        state.settings.scheme = b.dataset.v; save(); applyTheme();
         break;
       case 'weekStart':
         state.settings.weekStart = b.dataset.v; save();
