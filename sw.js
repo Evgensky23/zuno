@@ -1,14 +1,14 @@
 // Keeps Zuno working offline. Bump VERSION whenever app files change so phones pick up the new build.
-const VERSION = 'zuno-0.9.1';
+const VERSION = 'zuno-1.0.0';
 const SHELL = [
   './',
   './index.html',
   './style.css',
   './app.js',
   './manifest.webmanifest',
-  './icons/icon-192.png',
-  './icons/icon-512.png',
-  './icons/apple-touch-icon.png',
+  './icon-192.png',
+  './icon-512.png',
+  './apple-touch-icon.png',
 ];
 
 self.addEventListener('install', e => {

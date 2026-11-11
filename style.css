@@ -183,6 +183,11 @@ main {
 }
 @media (hover: hover) { .arrow:hover:not(:disabled) { border-color: var(--border-2); background: var(--hover); } }
 .arrow:disabled { color: var(--soft); }
+/* The date picker sits invisibly on top of the calendar button, so one tap opens it. */
+.arrow.cal { position: relative; overflow: hidden; cursor: pointer; margin-right: 6px; }
+.arrow.cal svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.arrow.cal input { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; opacity: 0; cursor: pointer; }
+.arrow.cal input::-webkit-calendar-picker-indicator { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; padding: 0; cursor: pointer; }
 .score {
   display: flex; align-items: baseline;
   margin: 28px 0 0 -4px;
@@ -306,6 +311,7 @@ main {
 .heat i.l4 { background: var(--l4); }
 .heat i.fut { background: transparent; box-shadow: inset 0 0 0 1px var(--border); }
 .heat i.now { outline: 1.5px solid var(--fg); outline-offset: 1px; }
+[data-act="openDay"] { cursor: pointer; }
 .legend { display: flex; align-items: center; gap: 3px; justify-content: flex-end; margin-top: 12px; font-size: 11px; }
 .legend i { width: 10px; height: 10px; border-radius: 2px; }
 .legend span { margin: 0 6px; }
@@ -376,15 +382,17 @@ main {
 .editor > .lbl { display: block; margin-bottom: 8px; }
 .field { position: relative; margin-bottom: 16px; }
 .field .lbl { display: block; margin-bottom: 6px; }
-input[type="text"], input[type="password"], select {
+input[type="text"], input[type="date"], select {
   width: 100%; height: 42px; padding: 0 12px;
   font: 400 16px/1 var(--sans); color: var(--fg); background: var(--bg);
   border: 1px solid var(--border-2); border-radius: 8px;
   outline: 0; appearance: none; -webkit-appearance: none;
   transition: border-color .15s, box-shadow .15s;
 }
-input[type="text"]:focus, input[type="password"]:focus, select:focus { border-color: var(--muted); box-shadow: 0 0 0 3px var(--hover); }
-input[type="text"]::placeholder, input[type="password"]::placeholder { color: var(--soft); }
+input[type="text"]:focus, input[type="date"]:focus, select:focus { border-color: var(--muted); box-shadow: 0 0 0 3px var(--hover); }
+input[type="text"]::placeholder { color: var(--soft); }
+input[type="date"] { font-family: var(--mono); font-size: 15px; text-align: left; min-width: 0; }
+input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 select { cursor: pointer; }
 select option { background: var(--bg); color: var(--fg); }
 .field.sel::after { content: '↓'; position: absolute; right: 12px; bottom: 13px; font: 13px/1 var(--mono); color: var(--muted); pointer-events: none; }
@@ -412,6 +420,7 @@ select option { background: var(--bg); color: var(--fg); }
   .btn.primary:hover { background: var(--fg); opacity: .86; }
 }
 .btn.ghost { color: var(--muted); }
+.btn.sm { height: 32px; padding: 0 14px; font-size: 13px; }
 .btn.right { margin-left: auto; }
 .err { margin-top: 12px; font: 500 13px/1.4 var(--sans); }
 .note { margin-top: 14px; font: 400 13px/1.5 var(--sans); color: var(--muted); }
@@ -424,6 +433,8 @@ select option { background: var(--bg); color: var(--fg); }
 .item:not([data-sort]) { padding-left: 10px; }
 .item .iname { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; text-align: left; padding: 13px 0 13px 6px; }
 .item .iname.static { display: flex; align-items: center; justify-content: flex-start; gap: 0; }
+.item.renaming { gap: 8px; padding: 8px 12px; }
+.item.renaming input { flex: 1; min-width: 0; height: 36px; }
 .item .x { color: var(--muted); font-size: 16px; line-height: 1; padding: 6px 0 6px 10px; }
 @media (hover: hover) { .item .x:hover { color: var(--fg); } }
 .handle {
@@ -660,51 +671,31 @@ button.srow { width: 100%; text-align: left; }
 @media (hover: hover) { .sugg-row:not(:disabled):hover { background: var(--hover); } }
 .sugg-f { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; }
 
-/* ask zuno */
-.starters { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 6px; }
-.starters button {
-  font: 500 13px/1 var(--sans); padding: 10px 14px; border: 1px solid var(--border);
-  border-radius: 999px; background: var(--surface); transition: border-color .15s;
+/* ---------- messages ---------- */
+.toast {
+  position: fixed; left: 50%; bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px) + 14px); z-index: 30;
+  display: flex; align-items: center; gap: 14px; width: max-content; max-width: calc(100vw - 32px);
+  padding: 11px 16px; border-radius: 12px; background: var(--fg); color: var(--bg);
+  font: 500 14px/1.35 var(--sans); box-shadow: 0 8px 28px rgba(0, 0, 0, .22);
+  translate: -50% 12px; opacity: 0; pointer-events: none; transition: opacity .2s, translate .2s;
 }
-@media (hover: hover) { .starters button:hover { border-color: var(--border-2); } }
-.thread { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
-.thread:empty { display: none; }
-.msg { max-width: 100%; }
-.msg.me {
-  align-self: flex-end; max-width: 85%; padding: 10px 14px; white-space: pre-wrap;
-  border-radius: 14px 14px 4px 14px; background: var(--fg); color: var(--bg); font-size: 15px; line-height: 1.5;
+.toast.show { translate: -50% 0; opacity: 1; pointer-events: auto; }
+.toast button { flex: none; font: 600 14px/1 var(--sans); color: var(--bg); text-decoration: underline; text-underline-offset: 4px; padding: 6px 0; }
+.alert {
+  margin: 16px 0 4px; padding: 13px 16px; border: 1px solid var(--fg); border-radius: var(--r);
+  font: 500 14px/1.45 var(--sans);
 }
-.msg.me small { display: block; margin-top: 4px; font: 500 10px/1.2 var(--mono); opacity: .65; }
-.msg.ai { padding: 16px; border: 1px solid var(--border); border-radius: var(--r); background: var(--surface); }
-.msg-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
-.waiting { color: var(--muted); font-size: 14px; }
-.dots { display: inline-flex; gap: 3px; margin-right: 6px; vertical-align: middle; }
-.dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite ease-in-out; }
-.dots i:nth-child(2) { animation-delay: .15s; }
-.dots i:nth-child(3) { animation-delay: .3s; }
-@keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
-
-.composer {
-  position: sticky; bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom)); z-index: 3; margin-top: 16px;
-  padding: 12px 0; background: var(--bg);
+.alert button { display: block; margin-top: 6px; text-decoration: underline; text-underline-offset: 4px; }
+.nudge {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 16px; padding: 14px 16px;
+  border: 1px solid var(--border); border-radius: var(--r); background: var(--surface);
 }
-.composer .err { margin: 0 0 10px; }
-.composer textarea {
-  display: block; width: 100%; min-height: 48px; max-height: 40vh; padding: 12px 14px; resize: none;
-  border: 1px solid var(--border-2); border-radius: 12px; background: var(--surface); color: var(--fg);
-  font: 400 16px/1.45 var(--sans); outline: 0; transition: border-color .15s, box-shadow .15s;
-}
-.composer textarea:focus { border-color: var(--muted); box-shadow: 0 0 0 3px var(--hover); }
-.composer textarea::placeholder { color: var(--soft); }
-.composer-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
-.chipbtn { display: inline-flex; align-items: center; gap: 8px; font: 500 13px/1 var(--sans); color: var(--muted); padding: 6px 0; }
-.chipbtn.on { color: var(--fg); }
-.chipbtn .sw i { width: 30px; height: 18px; }
-.chipbtn .sw i::after { width: 14px; height: 14px; }
-.chipbtn .sw.on i::after { translate: 12px 0; }
-.ask-foot { display: flex; justify-content: space-between; }
-.steps { margin: 4px 0 18px; padding-left: 20px; font-size: 14px; line-height: 1.6; color: var(--muted); }
-.steps b { color: var(--fg); font-weight: 600; }
+.nudge b { display: block; font: 600 14px/1.3 var(--sans); }
+.nudge small { display: block; margin-top: 3px; font: 400 13px/1.4 var(--sans); color: var(--muted); }
+.nudge-a { flex: none; display: flex; align-items: center; gap: 14px; }
+.empty.crash .actions { justify-content: center; margin-top: 18px; }
+.empty.crash .btn { text-decoration: none; }
+@media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
 
 /* ---------- color schemes ---------- */
 /* Each scheme sets ten category colors and an accent. [data-scheme-preview] lets the picker show every scheme at once. */

@@ -3,14 +3,15 @@
 
   const KEY = 'zuno.v1';
   const OLD_KEY = 'tally.v1'; // data saved before the rename
-  const VERSION = '0.9.1';
+  const VERSION = '1.0.0';
   const DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const DOW_LONG = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   const DOW1 = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
   const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
     'August', 'September', 'October', 'November', 'December'];
   const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
-  const DEFAULT_SETTINGS = { weekStart: 'mon', streaks: true, doneLast: false, aiStats: false, scheme: 'classic' };
+  const DEFAULT_SETTINGS = { weekStart: 'mon', streaks: true, doneLast: false, scheme: 'classic' };
+  const SCHEME_IDS = ['classic', 'vivid', 'soft', 'earth'];
 
   // Sections and their pages ([id, full label, short label for narrow screens]), shown as pills under the top bar.
   const NAV = [
@@ -30,10 +31,6 @@
       ['change', 'Change current habits', 'Change'],
       ['list', 'Your habits', 'Your habits'],
     ] },
-    { id: 'notebook', label: 'Notebook', subs: [
-      ['notes', 'Notes', 'Notes'],
-      ['ask', 'Ask Zuno', 'Ask Zuno'],
-    ] },
   ];
 
   // ---- dates (local, as YYYY-MM-DD strings so they compare lexically) ----
@@ -46,15 +43,22 @@
   const shortDate = s => { const d = parse(s); return `${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 3)}`; };
   const monthName = s => { const d = parse(s); return `${MONTHS[d.getMonth()]} ${d.getFullYear()}`; };
 
+  const daysBetween = (a, b) => Math.round((parse(a) - parse(b)) / 864e5);
+  const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && iso(parse(s)) === s;
+
   const uid = () => Math.random().toString(36).slice(2, 10);
   const esc = s => String(s).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  // Markdown to one line of plain text: drop heading/list markers and emphasis, keep hyphens inside words.
+  const plain = s => (s || '').replace(/^\s*(#{1,6}|[-*•]|\d+[.)])\s+/gm, '').replace(/[*`>_]+/g, '').replace(/\s+/g, ' ').trim();
 
   const DEFAULT_CATS = ['Sport', 'Health', 'Diet', 'Education', 'Religion', 'Mind', 'Sleep', 'Work', 'Social', 'Finance']
     .map(name => ({ id: name.toLowerCase(), name }));
 
   // ---- state ----
-  // A habit: { id, name, cat, created, mode: 'days' | 'weekly', days: [0..6], times, pauses: [{from, to}], archived }
+  // A habit: { id, name, cat, created, mode: 'days' | 'weekly', days: [0..6], times, hist, pauses: [{from, to}], archived }
+  // mode/days/times are the schedule now; hist: [{ from, mode, days, times }] keeps every earlier one,
+  // so editing a habit never rewrites its past.
   // Pauses hide a habit on those days without counting them as missed; archiving is an open-ended pause.
   function seed() {
     const t = today();
@@ -97,52 +101,156 @@
   function empty() {
     return { v: 1, theme: null, settings: { ...DEFAULT_SETTINGS },
       categories: DEFAULT_CATS.map(c => ({ ...c })), habits: [], log: {}, skips: {}, rest: {},
-      notes: [], chat: { items: [] } };
+      notes: [], backupAt: null, backupSnooze: null };
   }
   const blank = () => ({ ...empty(), theme: state.theme, settings: state.settings });
 
-  const valid = s => s && s.v === 1 && Array.isArray(s.habits) && Array.isArray(s.categories) && s.log && typeof s.log === 'object';
-  const normalize = s => ({
-    ...s,
-    settings: { ...DEFAULT_SETTINGS, ...(s.settings || {}) },
-    skips: s.skips || {},
-    rest: s.rest || {},
-    notes: Array.isArray(s.notes) ? s.notes : [],
-    chat: s.chat && Array.isArray(s.chat.items) ? s.chat : { items: [] },
-    habits: s.habits.map(h => ({ mode: 'days', times: 3, pauses: [], archived: null, ...h })),
-  });
+  const valid = s => !!s && typeof s === 'object' && s.v === 1 && Array.isArray(s.habits) && Array.isArray(s.categories);
+  const okId = s => typeof s === 'string' && /^[\w-]{1,48}$/.test(s);
+  const cleanSched = x => {
+    const mode = x.mode === 'weekly' ? 'weekly' : 'days';
+    const days = [...new Set((Array.isArray(x.days) ? x.days : []).filter(d => Number.isInteger(d) && d >= 0 && d <= 6))].sort();
+    return {
+      mode,
+      days: mode === 'days' && days.length ? days : [...ALL_DAYS],
+      times: Number.isInteger(x.times) && x.times >= 1 && x.times <= 7 ? x.times : 3,
+    };
+  };
+  const stamp = s => { const d = new Date(typeof s === 'string' ? s : NaN); return isNaN(d) ? new Date().toISOString() : d.toISOString(); };
+
+  // Rebuilds saved or imported data field by field, so a damaged or hand-edited file can't break the app.
+  function sanitize(s) {
+    const t = today();
+    const now = new Date().toISOString();
+    const categories = [];
+    const catIds = new Map(); // id in the file -> id in use
+    for (const c of s.categories) {
+      if (!c || typeof c.name !== 'string' || !c.name.trim() || catIds.has(c.id)) continue;
+      const id = okId(c.id) ? c.id : uid();
+      catIds.set(c.id, id);
+      categories.push({ id, name: c.name.trim().slice(0, 24) });
+    }
+    // Habits whose category is gone land in "Other" instead of disappearing from the lists.
+    const other = () => {
+      let c = categories.find(x => x.name.toLowerCase() === 'other');
+      if (!c) categories.push(c = { id: 'other-' + uid().slice(0, 4), name: 'Other' });
+      return c.id;
+    };
+
+    const habits = [];
+    const habitIds = new Map();
+    for (const h of s.habits) {
+      if (!h || typeof h.name !== 'string' || !h.name.trim() || habitIds.has(h.id)) continue;
+      const id = okId(h.id) ? h.id : uid();
+      habitIds.set(h.id, id);
+      const created = isDate(h.created) ? h.created : t;
+      const cur = cleanSched(h);
+      const hist = (Array.isArray(h.hist) ? h.hist : []).filter(x => x && isDate(x.from))
+        .map(x => ({ from: x.from, ...cleanSched(x) })).sort((a, b) => (a.from < b.from ? -1 : 1));
+      if (hist.length) Object.assign(hist[hist.length - 1], cur, { days: [...cur.days] });
+      else hist.push({ from: created, ...cur, days: [...cur.days] });
+      habits.push({
+        id, name: h.name.trim().slice(0, 60), cat: catIds.get(h.cat) || other(), created, ...cur, hist,
+        pauses: (Array.isArray(h.pauses) ? h.pauses : []).filter(p => p && isDate(p.from) && (p.to == null || isDate(p.to)))
+          .map(p => ({ from: p.from, to: p.to || null })),
+        archived: isDate(h.archived) ? h.archived : null,
+      });
+    }
+
+    const dayMap = m => {
+      const out = {};
+      for (const [d, list] of Object.entries(m && typeof m === 'object' ? m : {})) {
+        if (!isDate(d) || !Array.isArray(list)) continue;
+        const ids = [...new Set(list.map(x => habitIds.get(x)).filter(Boolean))];
+        if (ids.length) out[d] = ids;
+      }
+      return out;
+    };
+    const rest = {};
+    for (const [d, v] of Object.entries(s.rest && typeof s.rest === 'object' ? s.rest : {})) if (isDate(d) && v) rest[d] = true;
+
+    const sugg = list => {
+      const out = (Array.isArray(list) ? list : []).filter(h => h && typeof h.name === 'string' && h.name.trim())
+        .map(h => ({ name: h.name.trim().slice(0, 60), cat: catIds.get(h.cat) || '', ...cleanSched(h) }));
+      return out.length ? out : null;
+    };
+    const notes = [];
+    for (const n of Array.isArray(s.notes) ? s.notes : []) {
+      if (!n || typeof n !== 'object' || !(typeof n.title === 'string' && n.title.trim()) && !(typeof n.body === 'string' && n.body.trim())) continue;
+      notes.push({
+        id: okId(n.id) && !notes.some(x => x.id === n.id) ? n.id : uid(),
+        title: typeof n.title === 'string' ? n.title.slice(0, 80) : '',
+        body: typeof n.body === 'string' ? n.body : '',
+        created: stamp(n.created), updated: stamp(n.updated),
+        source: n.source === 'ai' ? 'ai' : 'me', habits: sugg(n.habits), added: !!n.added,
+      });
+    }
+    // Ask Zuno was removed in 1.0. Plans it wrote that were never saved move into Notes, so nothing is lost.
+    for (const it of s.chat && Array.isArray(s.chat.items) ? s.chat.items : []) {
+      if (!it || it.role !== 'assistant' || typeof it.text !== 'string') continue;
+      const list = sugg(it.habits);
+      if (it.text.length < 500 && !list) continue; // short replies were questions, not plans
+      if (it.noteId && notes.some(n => n.id === it.noteId)) continue;
+      const heading = (it.text.match(/^#{1,4}\s+(.+)$/m) || [])[1];
+      notes.push({ id: uid(), title: plain(heading || it.text.split('\n')[0]).slice(0, 60), body: it.text,
+        created: now, updated: now, source: 'ai', habits: list, added: !!it.added });
+    }
+
+    const st = s.settings && typeof s.settings === 'object' ? s.settings : {};
+    return {
+      v: 1,
+      theme: ['light', 'dark', 'system'].includes(s.theme) ? s.theme : null,
+      settings: {
+        weekStart: st.weekStart === 'sun' ? 'sun' : 'mon',
+        streaks: st.streaks !== false,
+        doneLast: !!st.doneLast,
+        scheme: SCHEME_IDS.includes(st.scheme) ? st.scheme : 'classic',
+      },
+      categories, habits, log: dayMap(s.log), skips: dayMap(s.skips), rest, notes,
+      backupAt: isDate(s.backupAt) ? s.backupAt : null,
+      backupSnooze: isDate(s.backupSnooze) ? s.backupSnooze : null,
+    };
+  }
 
   function load() {
+    let raw = null;
     try {
-      const s = JSON.parse(localStorage.getItem(KEY) || localStorage.getItem(OLD_KEY));
-      if (valid(s)) return normalize(s);
+      raw = localStorage.getItem(KEY) || localStorage.getItem(OLD_KEY);
+      const s = JSON.parse(raw);
+      if (valid(s)) return sanitize(s);
     } catch (e) { /* fall through */ }
+    // Saved data that can't be read is set aside, not overwritten.
+    if (raw) { try { localStorage.setItem(KEY + '.broken', raw); } catch (e) { /* no room */ } }
     return empty(); // first launch starts clean; sample data is one tap away in Settings
   }
+  let saveFailed = false;
   function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
+    try { localStorage.setItem(KEY, JSON.stringify(state)); saveFailed = false; }
+    catch (e) { saveFailed = true; } // shown as a warning at the top of every page
   }
 
   let state = load();
   save();
+  // Ask Zuno was removed in 1.0, so its API key has no use any more.
+  try { localStorage.removeItem('zuno.ai.key'); } catch (e) { /* nothing stored */ }
+  // Ask the browser not to clear Zuno's data when the device runs low on space.
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
   const ui = {
     view: 'today',
-    sub: { today: 'day', stats: 'overview', habits: 'add', notebook: 'notes' },
+    sub: { today: 'day', stats: 'overview', habits: 'add' },
     date: today(),
     range: 30,
     rep: { week: 0, month: 0 },
     edit: null,
-    form: { name: '', cat: 'sport', days: [...ALL_DAYS], newCat: '', mode: 'days', times: 3 },
+    form: { name: '', cat: 'sport', days: [...ALL_DAYS], newCat: '', mode: 'days', times: 3, created: today(), scope: 'today' },
+    catEdit: null,
     err: '',
     note: '',
     pop: null,
     noteId: null,
     noteEdit: false,
     sel: {},
-    ai: { busy: false, text: '', err: '' },
-    draft: '',
-    keyEdit: false,
   };
 
   // ---- queries ----
@@ -158,8 +266,19 @@
   const weekOrder = () => ALL_DAYS.map(i => (i + ws()) % 7);
   const weekStartOf = d => addDays(d, -((dow(d) - ws() + 7) % 7));
 
+  // The schedule a habit had on day d: the latest entry that had started by then.
+  function sched(h, d) {
+    for (let i = h.hist.length - 1; i > 0; i--) if (h.hist[i].from <= d) return h.hist[i];
+    return h.hist[0];
+  }
+  const schedKey = x => (x.mode === 'weekly' ? 'w' + x.times : 'd' + [...x.days].sort().join(''));
+
   // Shown on the day's list.
-  const listed = (h, d) => h.created <= d && !isPaused(h, d) && (h.mode === 'weekly' || h.days.includes(dow(d)));
+  function listed(h, d) {
+    if (h.created > d || isPaused(h, d)) return false;
+    const s = sched(h, d);
+    return s.mode === 'weekly' || s.days.includes(dow(d));
+  }
   const open = (h, d) => listed(h, d) && !isRest(d) && !isSkipped(h, d);
 
   function weekCount(h, d) {
@@ -175,11 +294,12 @@
     if (!listed(h, d)) return false;
     if (isDone(h, d)) return true;
     if (isRest(d) || isSkipped(h, d)) return false;
-    if (h.mode !== 'weekly') return true;
+    const s = sched(h, d);
+    if (s.mode !== 'weekly') return true;
     const start = weekStartOf(d);
     let before = 0;
     for (let x = start; x < d; x = addDays(x, 1)) if (isDone(h, x)) before++;
-    const need = h.times - before;
+    const need = s.times - before;
     if (need <= 0) return false;
     let left = 0;
     for (let x = d, end = addDays(start, 6); x <= end; x = addDays(x, 1)) if (open(h, x)) left++;
@@ -203,13 +323,13 @@
   // Skipped, rest and paused days never count as missed.
   function habitStreak(h) {
     const from = openFrom();
-    const gap = h.mode === 'weekly' ? 8 - h.times : 0;
     let count = 0, missed = 0;
     for (let d = today(), i = 0; d >= h.created && i < 3660; d = addDays(d, -1), i++) {
-      if (h.mode !== 'weekly' && !h.days.includes(dow(d))) continue;
+      const s = sched(h, d);
+      if (s.mode !== 'weekly' && !s.days.includes(dow(d))) continue;
       if (isDone(h, d)) { count++; missed = 0; continue; }
       if (neutralDay(h, d) || d >= from) continue;
-      if (++missed > gap) break;
+      if (++missed > (s.mode === 'weekly' ? 8 - s.times : 0)) break;
     }
     return count;
   }
@@ -309,6 +429,18 @@
   const segHtml = (act, cur, opts) => `<div class="seg">${opts.map(([v, l]) =>
     `<button class="${v === cur ? 'on' : ''}" data-act="${act}" data-v="${v}">${l}</button>`).join('')}</div>`;
 
+  // A reminder on Today once there is a week of history and the last backup is a month old.
+  function backupNudge() {
+    const t = today();
+    if (ui.date !== t || Object.keys(state.log).length < 7) return '';
+    if (state.backupSnooze && state.backupSnooze > t) return '';
+    if (state.backupAt && daysBetween(t, state.backupAt) < 30) return '';
+    return `<div class="nudge">
+      <span><b>Back up your data</b><small>${state.backupAt ? `Last backup: ${shortDate(state.backupAt)}.` : 'No backup yet.'} Your history lives only on this device.</small></span>
+      <span class="nudge-a"><button class="btn sm primary" data-act="export">Back up</button><button class="linkbtn" data-act="snooze">Later</button></span>
+    </div>`;
+  }
+
   // ---- today: the day ----
   function viewDay() {
     const t = today();
@@ -335,6 +467,10 @@
               ${state.habits.length ? fire(dayStreak(), 'Days in a row with at least half of your habits done') : ''}</span>
           </div>
           <div class="arrows">
+            <label class="arrow cal" title="Pick a date">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5.5" width="16" height="14" rx="2.5"/><path d="M4 10h16M8.5 3.5v4M15.5 3.5v4"/></svg>
+              <input type="date" id="jump" value="${d}" max="${t}" aria-label="Pick a date">
+            </label>
             <button class="arrow" data-act="shift" data-n="-1" aria-label="Previous day">←</button>
             <button class="arrow" data-act="shift" data-n="1" aria-label="Next day" ${d >= t ? 'disabled' : ''}>→</button>
           </div>
@@ -373,12 +509,13 @@
     const row = h => {
       const done = isDone(h, d);
       const skipped = isSkipped(h, d);
-      const weekly = h.mode === 'weekly';
+      const sc = sched(h, d);
+      const weekly = sc.mode === 'weekly';
       const wk = weekly ? weekCount(h, d) : 0;
-      const met = weekly && !done && wk >= h.times;
+      const met = weekly && !done && wk >= sc.times;
       let meta = '';
       if (skipped) meta = 'Skipped';
-      else if (weekly) meta = met ? 'Done for the week' : `${wk}/${h.times} this week`;
+      else if (weekly) meta = met ? 'Done for the week' : `${wk}/${sc.times} this week`;
       if (showStreaks && !skipped) { const n = habitStreak(h); if (n) meta += (meta ? ' ' : '') + fire(n, `${n} in a row`); }
       return `<div class="habit ${done ? 'done' : ''} ${skipped ? 'skipped' : ''} ${met ? 'met' : ''} ${ui.pop === h.id ? 'pop' : ''}">
         <button class="hmain" data-act="toggle" data-id="${h.id}" aria-pressed="${done}">
@@ -402,7 +539,7 @@
       </section>`;
     }).join('');
 
-    return hero + week + groups;
+    return hero + week + backupNudge() + groups;
   }
 
   // ---- today: past week / past month reports ----
@@ -483,7 +620,7 @@
     let days;
     if (kind === 'week') {
       days = `<div class="card pad"><div class="wbars">${cur.perDay.map(p => `
-        <div class="wb" title="${tip(p)}">
+        <div class="wb" data-act="openDay" data-date="${p.d}" title="${tip(p)}">
           <span class="wv">${isRest(p.d) ? 'Rest' : p.total ? `${p.done}/${p.total}` : '–'}</span>
           <span class="wt"><b style="height:${p.total ? (p.done / p.total) * 100 : 0}%"></b></span>
           <span class="wl">${DOW1[dow(p.d)]}<br>${parse(p.d).getDate()}</span>
@@ -492,7 +629,7 @@
       const lead = (dow(b.from) - ws() + 7) % 7;
       const cells = '<i class="pad"></i>'.repeat(lead) + cur.perDay.map(p => {
         const l = lvl(p);
-        return `<i class="l${l} ${l >= 3 ? 'dk' : ''} ${isRest(p.d) ? 'rest' : ''}" title="${tip(p)}"><span>${parse(p.d).getDate()}</span></i>`;
+        return `<i class="l${l} ${l >= 3 ? 'dk' : ''} ${isRest(p.d) ? 'rest' : ''}" data-act="openDay" data-date="${p.d}" title="${tip(p)}"><span>${parse(p.d).getDate()}</span></i>`;
       }).join('');
       days = `<div class="card pad">
         <div class="mcal-h">${weekOrder().map(w => `<span>${DOW1[w]}</span>`).join('')}</div>
@@ -592,10 +729,10 @@
       if (d > t) { cells += '<i class="fut"></i>'; continue; }
       const s = dayScore(d);
       const lvl = !s.total || !s.done ? 0 : Math.max(1, Math.ceil((s.done / s.total) * 4));
-      cells += `<i class="${lvl ? 'l' + lvl : ''} ${d === t ? 'now' : ''}" title="${shortDate(d)} · ${s.done}/${s.total}"></i>`;
+      cells += `<i class="${lvl ? 'l' + lvl : ''} ${d === t ? 'now' : ''}" data-act="openDay" data-date="${d}" title="${shortDate(d)} · ${s.done}/${s.total}"></i>`;
     }
     const heat = `
-      <div class="section-h"><h3>Twelve weeks</h3><span class="frac">Each square is a day</span></div>
+      <div class="section-h"><h3>Twelve weeks</h3><span class="frac">Tap a square to open that day</span></div>
       <div class="card pad"><div class="heatwrap">
         <div class="heatdays">${weekOrder().map((w, i) => `<span>${i % 2 === 0 ? DOW1[w] : ''}</span>`).join('')}</div>
         <div class="heat">${cells}</div>
@@ -759,6 +896,20 @@
           <button data-act="preset" data-p="we">Weekends</button>
         </div>`;
 
+    // Changing the schedule of an existing habit starts from today unless you ask for the whole history.
+    const scope = h && schedKey(f) !== schedKey(h) ? `
+        <span class="lbl">Apply the new schedule</span>
+        <div class="often">${segHtml('fscope', f.scope, [['today', 'From today'], ['all', 'To all history']])}</div>
+        <p class="hint">${f.scope === 'all'
+          ? 'Past days are recounted with the new schedule, so your stats and streak can change.'
+          : 'Your past stats and streak stay as they were.'}</p>` : '';
+    const since = `
+        <div class="field">
+          <span class="lbl">Tracking since</span>
+          <input type="date" id="f-created" value="${esc(f.created)}" max="${today()}">
+        </div>
+        <p class="hint">Pick an earlier date to fill in days you already did. Days left unticked from then on count as missed.</p>`;
+
     const manage = h ? `
         <div class="actions">
           ${h.archived ? '<button class="btn" data-act="restore">Restore</button>'
@@ -790,6 +941,8 @@
         <span class="lbl">How often</span>
         <div class="often">${segHtml('fmode', f.mode, [['days', 'On set days'], ['weekly', 'Times a week']])}</div>
         ${often}
+        ${scope}
+        ${since}
         <div class="actions">
           <button class="btn primary" data-act="saveHabit">${h ? 'Save changes' : 'Add habit'}</button>
           ${h ? '<button class="btn ghost" data-act="cancel">Cancel</button>' : ''}
@@ -832,12 +985,19 @@
 
     const counts = id => state.habits.filter(h => h.cat === id).length;
     const cats = `
-      <div class="section-h"><h3>Categories</h3><span class="frac">Drag to reorder</span></div>
+      <div class="section-h"><h3>Categories</h3><span class="frac">Tap a name to rename it</span></div>
       <div class="card sortlist cats" data-sort-kind="cats">${state.categories.map(c => {
         const k = counts(c.id);
+        if (ui.catEdit === c.id) {
+          return `<div class="item renaming" data-sort data-id="${c.id}">
+            <input type="text" id="c-rename" value="${esc(c.name)}" maxlength="24" autocomplete="off" aria-label="Category name">
+            <button class="btn sm primary" data-act="catSave">Save</button>
+            <button class="btn sm ghost" data-act="catCancel">Cancel</button>
+          </div>`;
+        }
         return `<div class="item" data-sort data-id="${c.id}">
           <button class="handle" data-id="${c.id}" aria-label="Move ${esc(c.name)}. Use arrow keys or drag." title="Drag to reorder"></button>
-          <span class="iname static">${catIcon(c.id)}${esc(c.name)}</span>
+          <button class="iname static" data-act="catEdit" data-id="${c.id}" aria-label="Rename ${esc(c.name)}">${catIcon(c.id)}${esc(c.name)}</button>
           ${k ? `<span class="sched">${k}</span>` : `<button class="x" data-act="delCat" data-id="${c.id}" aria-label="Remove ${esc(c.name)}">×</button>`}
         </div>`;
       }).join('')}</div>
@@ -897,7 +1057,7 @@
   // ---- notebook ----
   // A note: { id, title, body (markdown), created, updated, source: 'me' | 'ai', habits: [suggestion] | null }
 
-  // Small, safe markdown renderer for notes and AI replies: headings, lists, bold, italic, code, rules.
+  // Small, safe markdown renderer for notes: headings, lists, bold, italic, code, rules.
   function md(src) {
     const inline = s => s
       .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
@@ -919,8 +1079,6 @@
     close();
     return html;
   }
-  // Markdown to one line of plain text: drop heading/list markers and emphasis, keep hyphens inside words.
-  const plain = s => (s || '').replace(/^\s*(#{1,6}|[-*•]|\d+[.)])\s+/gm, '').replace(/[*`>_]+/g, '').replace(/\s+/g, ' ').trim();
   const noteTitle = n => n.title.trim() || plain(n.body).slice(0, 48) || 'Untitled note';
   const findNote = id => state.notes.find(n => n.id === id);
 
@@ -939,7 +1097,7 @@
     ui.noteEdit = false;
   }
 
-  // Suggested habits (from the AI) with one-tap add. `key` scopes the checkbox state.
+  // Suggested habits saved with a note (from the old Ask Zuno), with one-tap add. `key` scopes the checkbox state.
   function suggestions(key, list, added) {
     if (!list || !list.length) return '';
     const existing = new Set(state.habits.map(h => h.name.trim().toLowerCase()));
@@ -960,14 +1118,25 @@
     </div>`;
   }
 
+  // A habit always belongs to a category that exists; one whose category was removed goes to "Other".
+  function newHabit(fields, created) {
+    let cat = fields.cat;
+    if (!state.categories.some(c => c.id === cat)) {
+      let c = state.categories.find(x => x.name.toLowerCase() === 'other');
+      if (!c) state.categories.push(c = { id: 'other-' + uid().slice(0, 4), name: 'Other' });
+      cat = c.id;
+    }
+    return { id: uid(), ...fields, cat, created,
+      hist: [{ from: created, mode: fields.mode, days: [...fields.days], times: fields.times }], pauses: [], archived: null };
+  }
+
   function addSuggested(key, list) {
     const sel = ui.sel[key] || [];
     const existing = new Set(state.habits.map(h => h.name.trim().toLowerCase()));
     let n = 0;
     list.forEach((h, i) => {
       if (!sel[i] || existing.has(h.name.toLowerCase())) return;
-      state.habits.push({ id: uid(), name: h.name, cat: h.cat, mode: h.mode, times: h.times, days: [...h.days],
-        created: today(), pauses: [], archived: null });
+      state.habits.push(newHabit({ name: h.name, cat: h.cat, mode: h.mode, times: h.times, days: [...h.days] }, today()));
       n++;
     });
     return n;
@@ -980,14 +1149,12 @@
       <button class="note-card" data-act="openNote" data-id="${n.id}">
         <span class="nt">${esc(noteTitle(n))}</span>
         <span class="ns">${esc(plain(n.body).slice(0, 140)) || '&nbsp;'}</span>
-        <span class="nm">${shortDate(n.updated.slice(0, 10))}${n.source === 'ai' ? ' · From Ask Zuno' : ''}${n.habits && n.habits.length ? ` · ${n.habits.length} habits` : ''}</span>
+        <span class="nm">${shortDate(n.updated.slice(0, 10))}${n.habits && n.habits.length ? ` · ${n.habits.length} habits` : ''}</span>
       </button>`).join('')}</div>`
-      : `<div class="empty"><p>Your notebook is empty.</p>Write down meal ideas, workouts or thoughts, or
-        <button data-view="notebook" data-sub="ask">ask Zuno for a plan →</button></div>`;
+      : `<div class="empty"><p>Your notebook is empty.</p>Write down meal ideas, workouts or thoughts.</div>`;
     return pageHead('Notebook', 'Notes') + `
       <div class="actions" style="margin-top:12px">
         <button class="btn primary" data-act="newNote">New note</button>
-        <button class="btn" data-view="notebook" data-sub="ask">Ask Zuno</button>
       </div>` + list;
   }
 
@@ -1007,7 +1174,7 @@
     return back + `
       <article class="note-read">
         <h2>${esc(noteTitle(n))}</h2>
-        <div class="nm">${n.source === 'ai' ? 'From Ask Zuno · ' : ''}Edited ${shortDate(n.updated.slice(0, 10))}</div>
+        <div class="nm">Edited ${shortDate(n.updated.slice(0, 10))}</div>
         <div class="md">${md(n.body) || '<p class="lbl">Empty note.</p>'}</div>
         ${suggestions('note-' + n.id, n.habits, n.added)}
         <div class="actions" style="margin-top:18px">
@@ -1015,257 +1182,6 @@
           <button class="btn ghost right" data-act="delNote">Delete</button>
         </div>
       </article>`;
-  }
-
-  // ---- ask zuno (Claude, with the person's own API key) ----
-  const AI_KEY = 'zuno.ai.key';
-  const AI_MODEL = 'claude-opus-5-5';
-  const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.1.0/+esm';
-  const aiKey = () => { try { return localStorage.getItem(AI_KEY) || ''; } catch (e) { return ''; } };
-  let sdk = null;
-
-  const STARTERS = [
-    ['Meal plan', 'Make me a 7-day meal plan. My goal: '],
-    ['Training plan', 'Make me a training plan. My goal: '],
-    ['Build a routine', 'Help me build a daily routine for '],
-    ['Review my progress', 'Look at my habits and tell me what to change to stay more consistent.'],
-  ];
-
-  function systemPrompt() {
-    const t = parse(today());
-    return `You are the assistant inside Zuno, a habit-tracking app. People use you to plan the things they want to turn into habits: meal plans, training plans, study, prayer or sleep routines and similar.
-
-How to answer:
-- Before writing a meal or training plan, make sure you know the goal, the person's current level and weekly schedule, and any allergies, dietary rules, injuries or medical conditions. If something important is missing, ask for it in one short message with at most four questions, then wait. If they already gave enough, or ask you to just go ahead, write the plan with sensible assumptions and say what you assumed.
-- Plans are general guidance, not medical advice; say so once, in one short line. If someone mentions a medical condition, pregnancy, an eating disorder or an injury, keep the advice conservative and suggest checking with a doctor, dietitian or physiotherapist.
-- Your answer is read on a phone. Use short headings (##), bullet lists and bold for key numbers. No tables and no emojis. Keep it as short as the request allows.
-- When a plan or routine involves things to do regularly, call suggest_habits with 1 to 6 habits that capture it, after writing the plan. Each habit is a short, checkable action. Match the plan's schedule: mode "days" with the weekdays, or mode "weekly" with a number of times per week when any days will do. Skip habits the person already has, if you know them.
-- Reply in the language the person writes in.
-
-Today is ${DOW_LONG[dow(today())]}, ${t.getDate()} ${MONTHS[t.getMonth()]} ${t.getFullYear()}.`;
-  }
-
-  function habitTool() {
-    return {
-      name: 'suggest_habits',
-      description: 'Show the person habits they can add to Zuno with one tap. Call it after writing a plan or routine that involves regular actions.',
-      strict: true,
-      eager_input_streaming: true,
-      input_schema: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['habits'],
-        properties: {
-          habits: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              required: ['name', 'category', 'mode', 'days', 'times'],
-              properties: {
-                name: { type: 'string', description: 'Short action, at most 40 characters, e.g. "Run 5 km" or "Protein with breakfast"' },
-                category: { type: 'string', enum: state.categories.map(c => c.name), description: 'The Zuno category it belongs to' },
-                mode: { type: 'string', enum: ['days', 'weekly'], description: '"days" for fixed weekdays, "weekly" for a number of times per week on any days' },
-                days: { type: 'array', items: { type: 'integer' }, description: 'For mode "days": weekdays, 0 = Monday to 6 = Sunday. Empty for "weekly".' },
-                times: { type: 'integer', description: 'For mode "weekly": times per week, 1 to 7. 0 for "days".' },
-              },
-            },
-          },
-        },
-      },
-    };
-  }
-
-  // Tool input arrives via eager streaming and isn't validated by the API, so check every field here.
-  function cleanHabits(input) {
-    if (!input || !Array.isArray(input.habits)) return [];
-    return input.habits.filter(h => h && typeof h.name === 'string' && h.name.trim()).slice(0, 8).map(h => {
-      const cat = state.categories.find(c => c.name.toLowerCase() === String(h.category || '').toLowerCase()) || state.categories[0];
-      const weekly = h.mode === 'weekly';
-      const days = [...new Set((Array.isArray(h.days) ? h.days : []).filter(d => Number.isInteger(d) && d >= 0 && d <= 6))].sort();
-      return {
-        name: h.name.trim().slice(0, 60),
-        cat: cat ? cat.id : '',
-        mode: weekly ? 'weekly' : 'days',
-        days: weekly || !days.length ? [...ALL_DAYS] : days,
-        times: weekly ? Math.min(7, Math.max(1, Number.isInteger(h.times) && h.times > 0 ? h.times : 3)) : 3,
-      };
-    }).filter(h => h.cat);
-  }
-
-  // What gets shared when "Use my habit stats" is on.
-  function statsContext() {
-    const t = today();
-    const live = state.habits.filter(h => !h.archived);
-    const lines = live.map(h => {
-      const r = habitRange(h, 30);
-      return `- ${h.name} · ${catName(h.cat)} · ${schedLabel(h)} · last 30 days ${r.done}/${r.total}${r.total ? ` (${pct(r.done, r.total)}%)` : ''} · done ${habitStreak(h)} times in a row${isPaused(h, t) ? ' · paused' : ''}`;
-    });
-    let done = 0, total = 0;
-    for (let i = 0; i < 30; i++) { const s = dayScore(addDays(t, -i)); done += s.done; total += s.total; }
-    return `<zuno_context>
-Shared by the person from their Zuno tracker.
-${lines.length ? `Habits:\n${lines.join('\n')}` : 'No habits yet.'}
-All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : ''}.
-</zuno_context>`;
-  }
-
-  function aiError(err) {
-    const A = sdk && sdk.default;
-    if (A && err instanceof A.APIUserAbortError) return 'Stopped.';
-    if (A && err instanceof A.AuthenticationError) return 'Anthropic rejected the API key. Check it under “Key” below.';
-    if (A && err instanceof A.PermissionDeniedError) return 'This API key isn’t allowed to use Claude. Check your Anthropic account.';
-    if (A && err instanceof A.RateLimitError) return 'Too many requests right now. Wait a minute and try again.';
-    if (A && err instanceof A.BadRequestError) return `Anthropic couldn’t take this request: ${err.message}`;
-    if (A && err instanceof A.InternalServerError) return 'Anthropic’s service had a problem. Try again in a moment.';
-    if (A && err instanceof A.APIConnectionError) return 'Couldn’t reach Anthropic. Check your internet connection.';
-    if (A && err instanceof A.APIError) return `Something went wrong (${err.status || 'error'}). Try again.`;
-    return 'Couldn’t reach Anthropic. Check your internet connection.';
-  }
-
-  async function askZuno(text) {
-    if (!text.trim() || ui.ai.busy || !aiKey()) return;
-    const items = state.chat.items;
-    const content = [];
-    // The previous answer may have called suggest_habits; the API expects a result for each call.
-    const last = items[items.length - 1];
-    if (last && last.role === 'assistant') {
-      for (const b of last.content) {
-        if (b.type === 'tool_use') content.push({ type: 'tool_result', tool_use_id: b.id, content: 'Shown to the person as one-tap habit suggestions.' });
-      }
-    }
-    if (state.settings.aiStats) content.push({ type: 'text', text: statsContext() });
-    content.push({ type: 'text', text: text.trim() });
-    items.push({ role: 'user', content, text: text.trim(), stats: !!state.settings.aiStats });
-    ui.draft = '';
-    ui.ai = { busy: true, text: '', err: '', stream: null };
-    save();
-    render();
-    scrollToEnd(true);
-
-    try {
-      if (!sdk) sdk = await import(SDK_URL);
-      const Anthropic = sdk.default;
-      const client = new Anthropic({ apiKey: aiKey(), dangerouslyAllowBrowser: true });
-      const stream = client.beta.messages.stream({
-        model: AI_MODEL,
-        max_tokens: 64000,
-        betas: ['server-side-fallback-2026-07-01'],
-        fallbacks: 'default', // if Opus declines, Anthropic retries on its recommended model
-        output_config: { effort: 'medium' },
-        system: systemPrompt(),
-        tools: [habitTool()],
-        messages: items.map(i => ({ role: i.role, content: i.content })),
-      });
-      ui.ai.stream = stream;
-      stream.on('text', delta => { ui.ai.text += delta; paintLive(); });
-      const msg = await stream.finalMessage();
-
-      if (msg.stop_reason === 'refusal') {
-        items.pop();
-        ui.draft = text;
-        ui.ai = { busy: false, text: '', err: 'Zuno’s assistant can’t help with that request. Try rephrasing it.' };
-      } else {
-        const reply = msg.content.filter(b => b.type === 'text').map(b => b.text).join('\n\n').trim();
-        const call = msg.content.find(b => b.type === 'tool_use' && b.name === 'suggest_habits');
-        items.push({
-          role: 'assistant',
-          content: msg.content, // kept whole and sent back unchanged on the next turn
-          text: reply,
-          habits: call ? cleanHabits(call.input) : [],
-          cut: msg.stop_reason === 'max_tokens',
-        });
-        ui.ai = { busy: false, text: '', err: '' };
-      }
-    } catch (err) {
-      items.pop(); // nothing was answered, so take the question back out of the history
-      ui.draft = text;
-      ui.ai = { busy: false, text: '', err: aiError(err) };
-    }
-    save();
-    if (ui.view === 'notebook' && ui.sub.notebook === 'ask') { render(); scrollToEnd(); }
-  }
-
-  function scrollToEnd(force) {
-    const nearEnd = window.innerHeight + window.scrollY >= document.body.scrollHeight - 200;
-    if (force || nearEnd) window.scrollTo({ top: document.body.scrollHeight });
-  }
-  function paintLive() {
-    const el = document.getElementById('ai-live');
-    if (!el) return;
-    el.innerHTML = md(ui.ai.text);
-    el.classList.remove('waiting');
-    scrollToEnd();
-  }
-
-  function viewAsk() {
-    const head = pageHead('Notebook', 'Ask Zuno');
-    if (!aiKey() || ui.keyEdit) return head + keyCard();
-    const items = state.chat.items;
-
-    const thread = items.map((it, idx) => it.role === 'user'
-      ? `<div class="msg me">${esc(it.text)}${it.stats ? '<small>Habit stats shared</small>' : ''}</div>`
-      : `<div class="msg ai">
-          <div class="md">${md(it.text) || '<p class="lbl">Suggested habits below.</p>'}</div>
-          ${it.cut ? '<p class="lbl">The answer was cut off. Ask Zuno to continue.</p>' : ''}
-          ${suggestions('chat-' + idx, it.habits, it.added)}
-          <div class="msg-actions">
-            ${it.noteId && findNote(it.noteId)
-              ? `<button class="linkbtn" data-act="openNote" data-id="${it.noteId}">Saved in Notes →</button>`
-              : `<button class="linkbtn" data-act="saveReply" data-i="${idx}">Save to notebook</button>`}
-          </div>
-        </div>`).join('');
-
-    const live = ui.ai.busy ? `<div class="msg ai"><div class="md ${ui.ai.text ? '' : 'waiting'}" id="ai-live">${ui.ai.text ? md(ui.ai.text) : '<span class="dots"><i></i><i></i><i></i></span> Thinking'}</div></div>` : '';
-
-    const intro = items.length ? '' : `
-      <p class="summary">Ask for a meal plan, a training plan or a routine. Zuno writes it up and offers the parts worth tracking as habits you can add with one tap.</p>
-      <div class="starters">${STARTERS.map(([label], i) => `<button data-act="starter" data-i="${i}">${label}</button>`).join('')}</div>`;
-
-    const s = state.settings.aiStats;
-    const composer = `
-      <div class="composer">
-        ${ui.ai.err ? `<div class="err">${esc(ui.ai.err)}</div>` : ''}
-        <textarea id="ai-input" rows="2" placeholder="Ask Zuno…" ${ui.ai.busy ? 'disabled' : ''}>${esc(ui.draft)}</textarea>
-        <div class="composer-row">
-          <button class="chipbtn ${s ? 'on' : ''}" data-act="aiStats" aria-pressed="${!!s}" title="Send a summary of your habits and last 30 days with your next questions">
-            <span class="sw ${s ? 'on' : ''}"><i></i></span>Use my habit stats</button>
-          ${ui.ai.busy
-            ? '<button class="btn" data-act="aiStop">Stop</button>'
-            : '<button class="btn primary" data-act="aiSend">Send</button>'}
-        </div>
-      </div>`;
-
-    const tools = `<div class="ask-foot">
-      ${items.length ? '<button class="linkbtn" data-act="aiNew">New conversation</button>' : '<span></span>'}
-      <button class="linkbtn" data-act="keyEdit">Key</button>
-    </div>`;
-
-    return head + intro + `<div class="thread">${thread}${live}</div>` + composer + tools +
-      `<div class="foot">Answers come from Claude by Anthropic, using your own API key. What you send here goes to Anthropic; your other data stays on this device. Plans are general guidance, not medical advice.</div>`;
-  }
-
-  function keyCard() {
-    const has = !!aiKey();
-    return `
-      <section class="editor">
-        <p class="summary" style="padding-top:0">Ask Zuno uses Claude, Anthropic’s AI. It needs your own Anthropic API key. The key is saved only on this device and is sent only to Anthropic.</p>
-        <ol class="steps">
-          <li>Sign in at <b>console.anthropic.com</b> and add some credit under Billing. A typical plan costs a few cents.</li>
-          <li>Open <b>API keys</b> and create a key.</li>
-          <li>Paste it below.</li>
-        </ol>
-        <div class="field">
-          <span class="lbl">API key</span>
-          <input type="password" id="ai-key" placeholder="${has ? 'Saved. Paste a new key to replace it' : 'sk-ant-…'}" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="actions">
-          <button class="btn primary" data-act="keySave">Save key</button>
-          ${has ? '<button class="btn ghost" data-act="keyCancel">Cancel</button><button class="btn ghost right" data-act="keyRemove">Remove key</button>' : ''}
-        </div>
-        ${ui.err ? `<div class="err">${esc(ui.err)}</div>` : ''}
-        <p class="hint" style="margin-bottom:0">What you type in Ask Zuno, and your habit stats if you switch that on, is sent to Anthropic to answer you. Notes, habits and history otherwise stay on this device. The key is not included in exported backups.</p>
-      </section>`;
   }
 
   // ---- settings ----
@@ -1316,22 +1232,15 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
         ${toggle('doneLast', 'Move finished habits down', 'Keeps what is left to do at the top')}
       </div>
 
-      <div class="section-h"><h3>Ask Zuno</h3><span class="frac">${aiKey() ? 'Key saved' : 'No key yet'}</span></div>
-      <div class="card list">
-        ${action('askKey', aiKey() ? 'Anthropic API key' : 'Set up Ask Zuno', aiKey() ? 'Saved on this device only. Replace or remove it' : 'Add your own Anthropic API key to use the AI')}
-        ${toggle('aiStats', 'Share habit stats', 'Send a summary of your habits and last 30 days with each question')}
-      </div>
-
       <div class="section-h"><h3>Data</h3><span class="frac">On this device</span></div>
       <div class="card list">
-        ${action('export', 'Export backup', 'Save everything as a .json file')}
-        ${action('import', 'Import backup', 'Replace current data with a .json file')}
+        ${action('export', 'Export backup', `Save everything as a file · ${state.backupAt ? 'last backup ' + shortDate(state.backupAt) : 'no backup yet'}`)}
+        ${action('import', 'Import backup', 'Replace current data with a backup file')}
         ${action('sample', 'Load sample data', 'Nine example habits with five weeks of history')}
-        ${action('erase', 'Erase everything', 'Remove all habits, history, notes and the API key', 'danger')}
+        ${action('erase', 'Erase everything', 'Remove all habits, history and notes', 'danger')}
       </div>
-      ${ui.note ? `<div class="err">${esc(ui.note)}</div>` : ''}
 
-      <div class="foot">Zuno ${VERSION} · ${state.habits.length} habits · ${days} days logged · ${state.notes.length} notes<br>Your data stays on this device. Only what you send to Ask Zuno goes to Anthropic.</div>`;
+      <div class="foot">Zuno ${VERSION} · ${state.habits.length} habits · ${days} days logged · ${state.notes.length} notes<br>Your data stays on this device. Nothing is sent anywhere.</div>`;
   }
 
   // ---- about ----
@@ -1400,7 +1309,7 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
         <div class="section-h"><h3>Digital isn’t about more screen time</h3></div>
         <div class="prose">
           <p>The point is not to spend longer on your phone. Zuno should take ten seconds: open it, tick what you did, close it. The phone just happens to be the one thing you carry everywhere, and it’s good at exactly the part paper never was: doing the sums and remembering all of it.</p>
-          <p>Everything stays on your device. No account, no feed, nobody else looking at your numbers. The one exception is Ask Zuno: what you type there goes to Anthropic, the company behind Claude, so it can answer.</p>
+          <p>Everything stays on your device. No account, no feed, nobody else looking at your numbers.</p>
         </div>
 
         <div class="closer">
@@ -1483,14 +1392,71 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
     about: viewAbout,
     stats: { overview: viewOverview, byhabit: viewByHabit, bycat: viewByCat, trajectory: viewTrajectory },
     habits: { add: viewAdd, change: viewChange, list: viewList },
-    notebook: { notes: viewNotes, ask: viewAsk },
+    notebook: viewNotes,
   };
-  function render() {
+  function draw() {
     renderNav();
     const v = VIEWS[ui.view];
-    $view.innerHTML = typeof v === 'function' ? v() : v[ui.sub[ui.view]]();
+    const warn = saveFailed ? `<div class="alert">Zuno couldn’t save your last change. This device’s storage may be full or blocked.
+      <button data-act="export">Back up your data now</button></div>` : '';
+    $view.innerHTML = warn + (typeof v === 'function' ? v() : v[ui.sub[ui.view]]());
     $view.querySelectorAll('textarea').forEach(autosize);
     ui.pop = null;
+  }
+  // If a page can't be drawn, say so and offer a way out instead of leaving a blank screen.
+  function render() {
+    try { draw(); } catch (e) {
+      console.error(e);
+      $view.innerHTML = `<div class="empty crash"><p>Zuno hit a problem showing this page.</p>
+        Your data is still saved on this device. Save a copy first, then reload.
+        <div class="actions">
+          <button class="btn primary" data-act="rescue">Save a copy of my data</button>
+          <button class="btn" data-act="reload">Reload</button>
+          <button class="btn ghost" data-act="erase">Erase and start fresh</button>
+        </div></div>`;
+    }
+  }
+
+  // A short message above the tab bar, with Undo when the last change can be taken back.
+  const $toast = document.createElement('div');
+  $toast.className = 'toast';
+  $toast.setAttribute('role', 'status');
+  document.body.append($toast);
+  let toastTimer = null;
+  let undoSnap = null; // the saved data as it was before the change
+  function toast(msg, snap) {
+    undoSnap = snap || null;
+    $toast.innerHTML = `<span>${esc(msg)}</span>${snap ? '<button data-act="undo">Undo</button>' : ''}`;
+    $toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(hideToast, snap ? 8000 : 3500);
+  }
+  function hideToast() {
+    $toast.classList.remove('show');
+    undoSnap = null;
+  }
+
+  // On phones the share sheet can put the file in Files or iCloud Drive; elsewhere it downloads.
+  async function saveFile(text, name) {
+    const file = new File([text], name, { type: 'application/json' });
+    if (matchMedia('(pointer: coarse)').matches && navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); return true; }
+      catch (e) { if (e.name === 'AbortError') return false; } // anything else: fall back to a download
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(file);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    return true;
+  }
+  async function exportBackup() {
+    if (!(await saveFile(JSON.stringify(state, null, 2), `zuno-${today()}.json`))) return;
+    state.backupAt = today();
+    state.backupSnooze = null;
+    save();
+    render();
+    toast('Backup saved');
   }
 
   function autosize(el) {
@@ -1501,10 +1467,9 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
   function go(view, sub) {
     if (sub) ui.sub[view] = sub;
     const changed = ui.view !== view || sub;
-    if (changed && ui.noteId) leaveNote();
+    if ((changed || view === 'notebook') && ui.noteId) leaveNote();
     ui.view = view;
     ui.note = '';
-    ui.keyEdit = false;
     if (changed) resetForm();
     render();
     window.scrollTo(0, 0);
@@ -1513,17 +1478,18 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
 
   function resetForm() {
     ui.edit = null;
+    ui.catEdit = null;
     ui.err = '';
     const cat = ui.form.cat === '__new' || !state.categories.some(c => c.id === ui.form.cat)
       ? (state.categories[0] || {}).id : ui.form.cat;
-    ui.form = { name: '', cat, days: [...ALL_DAYS], newCat: '', mode: 'days', times: 3 };
+    ui.form = { name: '', cat, days: [...ALL_DAYS], newCat: '', mode: 'days', times: 3, created: today(), scope: 'today' };
   }
 
   function startEdit(id) {
     const h = state.habits.find(x => x.id === id);
     if (!h) return;
     ui.edit = h.id; ui.err = ''; ui.note = '';
-    ui.form = { name: h.name, cat: h.cat, days: [...h.days], newCat: '', mode: h.mode, times: h.times };
+    ui.form = { name: h.name, cat: h.cat, days: [...h.days], newCat: '', mode: h.mode, times: h.times, created: h.created, scope: 'today' };
   }
 
   function saveHabit() {
@@ -1543,13 +1509,21 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       }
     }
     const fields = { name, cat, mode: f.mode, times: f.times, days: f.mode === 'weekly' ? [...ALL_DAYS] : [...f.days].sort() };
+    const created = isDate(f.created) && f.created <= today() ? f.created : today();
     const h = ui.edit && state.habits.find(x => x.id === ui.edit);
     if (h) {
-      Object.assign(h, fields);
+      if (schedKey(fields) !== schedKey(h)) {
+        const entry = { mode: fields.mode, days: [...fields.days], times: fields.times };
+        const last = h.hist[h.hist.length - 1];
+        if (f.scope === 'all') h.hist = [{ from: created, ...entry }];
+        else if (last.from >= today()) Object.assign(last, entry);
+        else h.hist.push({ from: today(), ...entry });
+      }
+      Object.assign(h, fields, { created });
       save(); resetForm();
       ui.note = '';
     } else {
-      state.habits.push({ id: uid(), ...fields, created: today(), pauses: [], archived: null });
+      state.habits.push(newHabit(fields, created));
       save();
       ui.form.cat = cat;
       resetForm();
@@ -1603,6 +1577,7 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
 
   // ---- events ----
   document.addEventListener('click', e => {
+    if (e.target.id === 'jump') { try { e.target.showPicker(); } catch (err) { /* opens by itself */ } return; }
     const b = e.target.closest('[data-act], [data-view]');
     if (!b || b.disabled) return;
 
@@ -1613,6 +1588,9 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       go(v, b.dataset.sub);
       return;
     }
+
+    // Undo covers one step: once you do something else, the earlier change stays.
+    if (undoSnap && b.dataset.act !== 'undo') hideToast();
 
     const id = b.dataset.id;
     const editing = () => state.habits.find(x => x.id === ui.edit);
@@ -1641,6 +1619,10 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
         break;
       }
       case 'date': ui.date = b.dataset.date; break;
+      case 'openDay':
+        if (b.dataset.date > today()) return;
+        ui.date = b.dataset.date; go('today', 'day'); return;
+      case 'fscope': ui.form.scope = b.dataset.v; break;
       case 'range': ui.range = Number(b.dataset.v); break;
       case 'rep': ui.rep[b.dataset.k] = Math.max(0, ui.rep[b.dataset.k] + Number(b.dataset.n)); break;
       case 'fmode': ui.form.mode = b.dataset.v; ui.err = ''; break;
@@ -1671,9 +1653,11 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       case 'archive': {
         const h = editing();
         if (!h) break;
+        const snap = JSON.stringify(state);
         pauseHabit(h);
         h.archived = today();
         save(); resetForm();
+        toast(`Archived “${h.name}”`, snap);
         break;
       }
       case 'restore': {
@@ -1686,12 +1670,14 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       }
       case 'delHabit': {
         const h = editing();
-        if (!h || !confirm(`Delete “${h.name}” and all of its history? Archive keeps the history instead.`)) return;
+        if (!h) return;
+        const snap = JSON.stringify(state);
         state.habits = state.habits.filter(x => x.id !== h.id);
         for (const map of [state.log, state.skips]) {
           for (const d of Object.keys(map)) toggleIn(map, d, h.id, false);
         }
         save(); resetForm();
+        toast(`Deleted “${h.name}” and its history`, snap);
         break;
       }
       case 'addCat': {
@@ -1704,11 +1690,34 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
         save();
         break;
       }
-      case 'delCat':
+      case 'delCat': {
+        const snap = JSON.stringify(state);
+        const name = catName(id);
         state.categories = state.categories.filter(c => c.id !== id);
         if (ui.form.cat === id) ui.form.cat = (state.categories[0] || {}).id;
         save();
+        toast(`Removed ${name}`, snap);
         break;
+      }
+      case 'catEdit': {
+        ui.catEdit = id;
+        render();
+        const input = document.getElementById('c-rename');
+        if (input) { input.focus(); input.select(); }
+        return;
+      }
+      case 'catCancel': ui.catEdit = null; break;
+      case 'catSave': {
+        const c = state.categories.find(x => x.id === ui.catEdit);
+        const name = document.getElementById('c-rename').value.trim().slice(0, 24);
+        if (c && name && state.categories.some(x => x !== c && x.name.toLowerCase() === name.toLowerCase())) {
+          toast('Another category already has that name');
+          return;
+        }
+        if (c && name) { c.name = name; save(); }
+        ui.catEdit = null;
+        break;
+      }
 
       // settings
       case 'theme':
@@ -1724,21 +1733,29 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       case 'setting':
         state.settings[b.dataset.k] = !state.settings[b.dataset.k]; save();
         break;
-      case 'export': {
-        const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `zuno-${today()}.json`;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      case 'export': exportBackup(); return;
+      case 'snooze': state.backupSnooze = addDays(today(), 7); save(); break;
+      case 'rescue': {
+        let raw = null;
+        try { raw = localStorage.getItem(KEY); } catch (err) { /* storage blocked */ }
+        saveFile(raw || JSON.stringify(state), `zuno-copy-${today()}.json`);
         return;
       }
-      case 'import': $file.value = ''; $file.click(); return;
-      case 'sample':
-        if (state.habits.length && !confirm('Replace your current habits and history with sample data?')) return;
-        replaceState(normalize({ ...seed(), theme: state.theme, settings: state.settings, notes: state.notes, chat: state.chat }));
-        ui.note = 'Sample data loaded';
+      case 'reload': location.reload(); return;
+      case 'undo':
+        if (!undoSnap) return;
+        state = JSON.parse(undoSnap);
+        save(); hideToast(); resetForm(); applyTheme();
         break;
+      case 'import': $file.value = ''; $file.click(); return;
+      case 'sample': {
+        if (state.habits.length && !confirm('Replace your current habits and history with sample data?')) return;
+        const snap = JSON.stringify(state);
+        replaceState(sanitize({ ...seed(), theme: state.theme, settings: state.settings, notes: state.notes,
+          backupAt: state.backupAt, backupSnooze: state.backupSnooze }));
+        toast('Sample data loaded', snap);
+        break;
+      }
       // notebook
       case 'newNote': {
         const n = newNote();
@@ -1748,7 +1765,7 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
         return;
       }
       case 'openNote':
-        if (ui.view !== 'notebook' || ui.sub.notebook !== 'notes') go('notebook', 'notes');
+        if (ui.view !== 'notebook') go('notebook');
         ui.noteId = id; ui.noteEdit = false;
         window.scrollTo(0, 0);
         break;
@@ -1760,12 +1777,14 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
         save();
         break;
       }
-      case 'delNote':
-        if (!confirm('Delete this note?')) return;
+      case 'delNote': {
+        const snap = JSON.stringify(state);
         state.notes = state.notes.filter(n => n.id !== ui.noteId);
         ui.noteId = null; ui.noteEdit = false;
         save();
+        toast('Note deleted', snap);
         break;
+      }
       case 'suggToggle': {
         const sel = ui.sel[b.dataset.k];
         if (sel) sel[Number(b.dataset.i)] = !sel[Number(b.dataset.i)];
@@ -1773,66 +1792,20 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       }
       case 'suggAdd': {
         const k = b.dataset.k;
-        const owner = k.startsWith('chat-') ? state.chat.items[Number(k.slice(5))] : findNote(k.slice(5));
+        const owner = findNote(k.slice(5));
         if (!owner || !owner.habits) break;
         const n = addSuggested(k, owner.habits);
         if (n) owner.added = true;
         save();
         break;
       }
-      case 'saveReply': {
-        const it = state.chat.items[Number(b.dataset.i)];
-        if (!it) break;
-        const heading = (it.text.match(/^#{1,4}\s+(.+)$/m) || [])[1];
-        const n = newNote({ title: plain(heading || it.text.split('\n')[0]).slice(0, 60), body: it.text, source: 'ai',
-          habits: it.habits && it.habits.length ? it.habits : null, added: !!it.added });
-        it.noteId = n.id;
-        save();
-        break;
-      }
-
-      // ask zuno
-      case 'starter': {
-        const [, text] = STARTERS[Number(b.dataset.i)];
-        ui.draft = text;
-        if (Number(b.dataset.i) === 3) { state.settings.aiStats = true; save(); }
-        render();
-        const input = document.getElementById('ai-input');
-        input.focus();
-        input.setSelectionRange(input.value.length, input.value.length);
-        return;
-      }
-      case 'aiSend': askZuno(document.getElementById('ai-input').value); return;
-      case 'aiStop': if (ui.ai.stream) ui.ai.stream.abort(); return;
-      case 'aiStats': state.settings.aiStats = !state.settings.aiStats; save(); break;
-      case 'aiNew':
-        if (ui.ai.busy) return;
-        state.chat.items = []; ui.sel = {}; ui.ai.err = ''; ui.draft = '';
-        save();
-        break;
-      case 'askKey': go('notebook', 'ask'); ui.keyEdit = true; break;
-      case 'keyEdit': ui.keyEdit = true; ui.err = ''; break;
-      case 'keyCancel': ui.keyEdit = false; ui.err = ''; break;
-      case 'keySave': {
-        const v = document.getElementById('ai-key').value.trim();
-        if (!v) { ui.err = 'Paste your key first.'; break; }
-        if (!v.startsWith('sk-')) { ui.err = 'That doesn’t look like an Anthropic API key. They start with “sk-ant-”.'; break; }
-        try { localStorage.setItem(AI_KEY, v); } catch (err) { ui.err = 'Couldn’t save the key on this device.'; break; }
-        ui.keyEdit = false; ui.err = '';
-        break;
-      }
-      case 'keyRemove':
-        if (!confirm('Remove your API key from this device?')) return;
-        try { localStorage.removeItem(AI_KEY); } catch (err) { /* nothing stored */ }
-        ui.keyEdit = false;
-        break;
-
-      case 'erase':
-        if (!confirm('Erase all habits, history, notes and the API key on this device?')) return;
-        try { localStorage.removeItem(AI_KEY); } catch (err) { /* nothing stored */ }
+      case 'erase': {
+        if (!confirm('Erase all habits, history and notes on this device?')) return;
+        const snap = JSON.stringify(state);
         replaceState(blank());
-        ui.note = 'Everything erased';
+        toast('Everything erased', snap);
         break;
+      }
       default: return;
     }
     render();
@@ -1914,17 +1887,21 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
     file.text().then(text => {
       let next;
       try { next = JSON.parse(text); } catch (e) { next = null; }
-      if (!valid(next)) { ui.note = 'That file is not a Zuno backup'; render(); return; }
+      try { next = valid(next) ? sanitize(next) : null; } catch (e) { next = null; }
+      if (!next) { toast('That file is not a Zuno backup'); return; }
       if (!confirm(`Replace current data with ${next.habits.length} habits from “${file.name}”?`)) return;
-      replaceState(normalize(next));
-      ui.note = 'Backup imported';
+      const snap = JSON.stringify(state);
+      next.backupAt = today(); // this data came from a file, so a copy of it exists
+      replaceState(next);
       render();
+      toast('Backup imported', snap);
     });
   });
 
   document.addEventListener('input', e => {
     if (e.target.id === 'f-name') { ui.form.name = e.target.value; ui.err = ''; }
     if (e.target.id === 'f-newcat') { ui.form.newCat = e.target.value; ui.err = ''; }
+    if (e.target.id === 'f-created') ui.form.created = e.target.value;
     if (e.target.id === 'n-title' || e.target.id === 'n-body') {
       const n = findNote(ui.noteId);
       if (!n) return;
@@ -1933,11 +1910,15 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       clearTimeout(noteTimer);
       noteTimer = setTimeout(save, 400);
     }
-    if (e.target.id === 'ai-input') ui.draft = e.target.value;
     if (e.target.tagName === 'TEXTAREA') autosize(e.target);
   });
   let noteTimer = null;
   document.addEventListener('change', e => {
+    if (e.target.id === 'f-created') ui.form.created = e.target.value;
+    if (e.target.id === 'jump') {
+      const v = e.target.value;
+      if (isDate(v) && v <= today()) { ui.date = v; render(); }
+    }
     if (e.target.id === 'f-cat') {
       ui.form.cat = e.target.value;
       render();
@@ -1959,8 +1940,9 @@ All habits, last 30 days: ${done}/${total}${total ? ` (${pct(done, total)}%)` : 
       if (again) again.focus();
       return;
     }
+    if (e.key === 'Escape' && e.target.id === 'c-rename') { ui.catEdit = null; render(); return; }
     if (e.key !== 'Enter') return;
-    if (e.target.id === 'ai-input' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); askZuno(e.target.value); return; }
+    if (e.target.id === 'c-rename') { document.querySelector('[data-act="catSave"]').click(); return; }
     if (e.target.id === 'n-title') { e.preventDefault(); document.getElementById('n-body').focus(); return; }
     if (e.target.id === 'f-name' || e.target.id === 'f-newcat') { saveHabit(); render(); }
     if (e.target.id === 'c-name') document.querySelector('[data-act="addCat"]').click();
